@@ -60,10 +60,16 @@ async def get_live_tick(
     timeframe: str = Query(default="5m", description="Candle timeframe e.g. 1m, 5m"),
 ) -> Dict[str, Any]:
     """
-    Ultra-fast (< 300ms) live price and active candle tick endpoint
-    for real-time moving chart candles (zero page refresh).
+    Ultra-fast (< 1ms) live price and active candle tick endpoint.
+    Served directly from in-memory LiveStreamer state — no external API call.
+    Falls back to market_data_service (Yahoo/Binance) if the streamer doesn't
+    have the pair yet (first few seconds after boot).
     """
+    from app.services.live_streamer import live_streamer
     norm_pair = market_data_service.normalize_pair(pair)
+    tick = live_streamer.get_live_tick(norm_pair, timeframe)
+    if tick and tick.get("status") == "success":
+        return tick
     return await market_data_service.fetch_live_tick(pair=norm_pair, timeframe=timeframe)
 
 

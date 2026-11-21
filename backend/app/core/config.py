@@ -10,7 +10,14 @@ BASE_DIR = Path(__file__).resolve().parent.parent.parent
 class Settings(BaseSettings):
     PROJECT_NAME: str = "AI Binary Trading Signal Platform"
     API_V1_STR: str = "/api/v1"
-    CORS_ORIGINS: List[str] = ["http://localhost:5173", "http://127.0.0.1:5173"]
+    CORS_ORIGINS: List[str] = [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:5174",
+        "http://localhost:3000",
+        "http://0.0.0.0:5173",
+        "*",
+    ]
     DATABASE_URL: str = "sqlite+aiosqlite:///./trading.db"
 
     @field_validator("CORS_ORIGINS", mode="before")

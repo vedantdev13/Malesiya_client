@@ -53,14 +53,17 @@ class ConnectionManager:
             self.disconnect(dead_conn)
 
 
+# Signal stream manager (for paper-trader + resolver signal events)
 ws_manager = ConnectionManager()
+
+# Market tick stream manager (for /ws/market — real-time price ticks, all 6 pairs)
+market_ws_manager = ConnectionManager()
 
 
 @router.websocket("/ws/live-signals")
 async def websocket_live_signals_endpoint(websocket: WebSocket):
     await ws_manager.connect(websocket)
     try:
-        # Send initial confirmation message
         await ws_manager.send_personal_message(
             {
                 "event": "CONNECTED",
@@ -69,21 +72,50 @@ async def websocket_live_signals_endpoint(websocket: WebSocket):
             websocket,
         )
         while True:
-            # Listen for client messages / pings
             data = await websocket.receive_text()
             try:
                 parsed = json.loads(data)
                 if parsed.get("type") == "ping":
-                    await ws_manager.send_personal_message(
-                        {"type": "pong"}, websocket
-                    )
+                    await ws_manager.send_personal_message({"type": "pong"}, websocket)
             except Exception:
-                # Handle plain text pings
                 if data.strip().lower() == "ping":
                     await websocket.send_text("pong")
     except WebSocketDisconnect:
         ws_manager.disconnect(websocket)
     except Exception as e:
-        logger.error(f"WebSocket error: {e}")
+        logger.error(f"WebSocket (live-signals) error: {e}")
         ws_manager.disconnect(websocket)
+
+
+@router.websocket("/ws/market")
+async def websocket_market_endpoint(websocket: WebSocket):
+    """
+    Real-Time Market Tick WebSocket (/ws/market).
+    Pushes live OHLC candle updates for all 6 pairs every 1 second.
+    Message shape:
+      { event: "MARKET_TICK", timestamp: "...", ticks: { PAIR: { price, candles: { 1m, 5m, 15m } } } }
+    """
+    await market_ws_manager.connect(websocket)
+    try:
+        await market_ws_manager.send_personal_message(
+            {
+                "event": "CONNECTED",
+                "message": "Connected to Quantum AI real-time market tick stream (all 6 pairs, 1s)",
+            },
+            websocket,
+        )
+        while True:
+            data = await websocket.receive_text()
+            try:
+                parsed = json.loads(data)
+                if parsed.get("type") == "ping":
+                    await market_ws_manager.send_personal_message({"type": "pong"}, websocket)
+            except Exception:
+                if data.strip().lower() == "ping":
+                    await websocket.send_text("pong")
+    except WebSocketDisconnect:
+        market_ws_manager.disconnect(websocket)
+    except Exception as e:
+        logger.error(f"WebSocket (market) error: {e}")
+        market_ws_manager.disconnect(websocket)
 

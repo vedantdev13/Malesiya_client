@@ -5,6 +5,7 @@ import PerformanceBar from './components/PerformanceBar';
 import {
   checkHealth,
   WS_BASE_URL,
+  WS_MARKET_URL,
   generateSignal,
   trainModel,
   trainPrimaryFx,
@@ -107,6 +108,24 @@ export default function App() {
 
   const { status: wsStatus } = useWebSocket(WS_BASE_URL, {
     onMessage: handleWsMessage,
+  });
+
+  // ─── Market tick WebSocket (for header live price sync) ───────────────────
+  const handleMarketTick = useCallback((msg) => {
+    if (msg.event !== 'MARKET_TICK' || !msg.ticks) return;
+    const curPair = selectedPairRef.current;
+    const tickData = msg.ticks[curPair];
+    if (!tickData) return;
+    const { price } = tickData;
+    if (price) {
+      setLastPrice(Number(price));
+      // Rough 24h change from first open (chart provides authoritative value via onPriceUpdate)
+    }
+  }, []);
+
+  useWebSocket(WS_MARKET_URL, {
+    onMessage: handleMarketTick,
+    pingIntervalMs: 20000,
   });
 
   // Switch pair and automatically surface latest signal for newly selected asset

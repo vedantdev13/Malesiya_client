@@ -29,6 +29,7 @@ from app.core.config import settings
 from app.core.database import init_db
 from app.services.paper_trader import start_paper_trading_loop
 from app.services.resolver import start_resolver_loop
+from app.services.live_streamer import live_streamer
 
 
 @asynccontextmanager
@@ -42,13 +43,18 @@ async def lifespan(app: FastAPI):
     # Start the autonomous paper trading loop
     paper_trader_task = asyncio.create_task(start_paper_trading_loop())
 
+    # Start the Quotex-Grade Real-Time Live Streamer (1s tick, all 6 pairs)
+    live_streamer_task = asyncio.create_task(live_streamer.start())
+
     yield
 
     # Clean shutdown of background tasks
+    live_streamer.is_running = False
     resolver_task.cancel()
     paper_trader_task.cancel()
+    live_streamer_task.cancel()
     try:
-        await asyncio.gather(resolver_task, paper_trader_task, return_exceptions=True)
+        await asyncio.gather(resolver_task, paper_trader_task, live_streamer_task, return_exceptions=True)
     except asyncio.CancelledError:
         pass
 
