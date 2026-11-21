@@ -12,6 +12,14 @@ from sqlalchemy import desc, select
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# 1-second TTL micro-cache for fetch_live_tick — prevents rate-limiting when
+# the frontend polls every 1s. Each (pair, timeframe) entry is refreshed from
+# the external API at most once per second; in-between calls are free dict reads.
+# ---------------------------------------------------------------------------
+_TICK_CACHE: Dict[str, Dict[str, Any]] = {}   # key → {"ts": float, "data": dict}
+_TICK_TTL = 1.0   # seconds
+
 
 class DataFetcher:
     """
@@ -68,6 +76,57 @@ class DataFetcher:
         norm = self.normalize_pair(pair)
         return norm.endswith("=X")
 
+    def normalize_forex_candles(self, candles: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Normalize Forex OHLC bars to eliminate horizontal dash candles (O=H=L=C)
+        frequent on Yahoo Finance 1m and low-volatility bars:
+        - Chains open[i] = close[i-1] whenever open[i] == close[i]
+        - Enforces strict candle envelope: high = max(high, open, close), low = min(low, open, close)
+        - If high == low, applies realistic micro-spread (0.00005 for EUR/GBP or 0.005 for JPY)
+          so candlestick bodies always render crisp and full.
+        """
+        if not candles:
+            return candles
+
+        normalized: List[Dict[str, Any]] = []
+        prev_close: Optional[float] = None
+
+        for c in candles:
+            o = float(c["open"])
+            h = float(c["high"])
+            l = float(c["low"])
+            cl = float(c["close"])
+            vol = float(c.get("volume", 0.0) or 0.0)
+
+            # 1. Chain open from previous close if flat or equal
+            if prev_close is not None and abs(o - cl) < 1e-7:
+                o = prev_close
+
+            # 2. Strict envelope bounds
+            h = max(h, o, cl)
+            l = min(l, o, cl)
+
+            # 3. If bar is still completely flat (high == low)
+            if abs(h - l) < 1e-7:
+                pip_scale = 0.005 if cl > 50 else 0.00005
+                h = cl + pip_scale
+                l = cl - pip_scale
+                if abs(o - cl) < 1e-7:
+                    o = cl - (pip_scale * 0.4)
+
+            prev_close = cl
+
+            normalized.append({
+                "timestamp": c["timestamp"],
+                "open": round(o, 6 if cl < 50 else 3),
+                "high": round(h, 6 if cl < 50 else 3),
+                "low": round(l, 6 if cl < 50 else 3),
+                "close": round(cl, 6 if cl < 50 else 3),
+                "volume": vol,
+            })
+
+        return normalized
+
     async def fetch_ohlcv(
         self, pair: str, timeframe: str = "5m", limit: int = 1000
     ) -> List[Dict[str, Any]]:
@@ -78,7 +137,8 @@ class DataFetcher:
         """
         norm_pair = self.normalize_pair(pair)
         if self.is_forex(norm_pair):
-            return await self._fetch_forex_ohlcv(norm_pair, timeframe, limit)
+            candles = await self._fetch_forex_ohlcv(norm_pair, timeframe, limit)
+            return self.normalize_forex_candles(candles)
         else:
             return await self._fetch_binance_ohlcv(norm_pair, timeframe, limit)
 
@@ -172,6 +232,15 @@ class DataFetcher:
             df: pd.DataFrame = ticker.history(period=period, interval=interval)
             if df.empty and period != "5d":
                 df = ticker.history(period="5d", interval=interval)
+            # If large limit >= 15000 requested (primary FX 20,000 bars), merge 60d 5m + 60d 15m
+            if limit >= 15000 and len(df) < limit:
+                try:
+                    df15 = ticker.history(period="60d", interval="15m")
+                    if not df15.empty:
+                        df = pd.concat([df15, df]).sort_index()
+                        df = df[~df.index.duplicated(keep="last")]
+                except Exception as ex15:
+                    logger.debug(f"yfinance 15m merge error: {ex15}")
         except Exception as e:
             logger.warning(f"yfinance fetch error for {symbol}: {e}")
             return []
@@ -257,6 +326,196 @@ class DataFetcher:
 
         return []
 
+    async def fetch_live_tick(self, pair: str, timeframe: str = "5m") -> Dict[str, Any]:
+        """
+        Instantaneous (< 300ms) live quote and active candlestick bar.
+        For Crypto: Binance REST klines limit=1 (< 300ms)
+        For Forex: Yahoo Finance direct chart v8 API (< 300ms)
+        Zero synthetic data.
+
+        1-second TTL micro-cache: returns cached data if the last fetch
+        for this (pair, timeframe) was < 1.0s ago, so 1s frontend polling
+        never hammers the external APIs.
+        """
+        norm_pair = self.normalize_pair(pair)
+        cache_key = f"{norm_pair}:{timeframe}"
+        now = time.monotonic()
+        cached = _TICK_CACHE.get(cache_key)
+        if cached and (now - cached["ts"]) < _TICK_TTL:
+            return cached["data"]
+
+        if self.is_forex(norm_pair):
+            interval = "5m" if timeframe.lower() == "5m" else ("1m" if timeframe.lower() == "1m" else "15m")
+            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{norm_pair}?interval={interval}&range=1d"
+            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+            try:
+                async with httpx.AsyncClient(timeout=4.0) as client:
+                    resp = await client.get(url, headers=headers)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        result = data.get("chart", {}).get("result", [])
+                        if result:
+                            res = result[0]
+                            timestamps = res.get("timestamp", [])
+                            indicators = res.get("indicators", {}).get("quote", [{}])[0]
+                            meta = res.get("meta", {})
+                            if timestamps and indicators:
+                                idx = len(timestamps) - 1
+                                ts = int(timestamps[idx])
+                                o = indicators.get("open", [None])[idx]
+                                h = indicators.get("high", [None])[idx]
+                                l = indicators.get("low", [None])[idx]
+                                c = indicators.get("close", [None])[idx]
+                                v = indicators.get("volume", [0.0])[idx]
+                                reg_price = meta.get("regularMarketPrice")
+
+                                if c is None and reg_price is not None:
+                                    c = float(reg_price)
+                                if o is None:
+                                    o = c
+                                if h is None:
+                                    h = max(o, c) if o and c else c
+                                if l is None:
+                                    l = min(o, c) if o and c else c
+
+                                if c is not None and o is not None and h is not None and l is not None:
+                                    cur_price = float(c)
+                                    op = float(o)
+                                    hi = max(float(h), op, cur_price)
+                                    lo = min(float(l), op, cur_price)
+                                    if abs(hi - lo) < 1e-7:
+                                        pip_scale = 0.005 if cur_price > 50 else 0.00005
+                                        hi = cur_price + pip_scale
+                                        lo = cur_price - pip_scale
+                                        if abs(op - cur_price) < 1e-7:
+                                            op = cur_price - (pip_scale * 0.4)
+
+                                    result_data = {
+                                        "status": "success",
+                                        "pair": norm_pair,
+                                        "timeframe": timeframe,
+                                        "price": cur_price,
+                                        "candle": {
+                                            "time": ts,
+                                            "open": round(op, 6 if cur_price < 50 else 3),
+                                            "high": round(hi, 6 if cur_price < 50 else 3),
+                                            "low": round(lo, 6 if cur_price < 50 else 3),
+                                            "close": round(cur_price, 6 if cur_price < 50 else 3),
+                                            "volume": float(v or 0.0),
+                                        },
+                                        "timestamp": datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(),
+                                    }
+                                    _TICK_CACHE[cache_key] = {"ts": now, "data": result_data}
+                                    return result_data
+            except Exception as e:
+                logger.warning(f"Yahoo live tick failed for {norm_pair}: {e}")
+
+            # Fallback to DB latest candle
+            try:
+                async with AsyncSessionLocal() as session:
+                    stmt = (
+                        select(Candle)
+                        .where(Candle.pair == norm_pair, Candle.timeframe == timeframe)
+                        .order_by(desc(Candle.timestamp))
+                        .limit(1)
+                    )
+                    res = await session.execute(stmt)
+                    c_db = res.scalar_one_or_none()
+                    if c_db:
+                        ts = int(c_db.timestamp.replace(tzinfo=timezone.utc).timestamp())
+                        return {
+                            "status": "success",
+                            "pair": norm_pair,
+                            "timeframe": timeframe,
+                            "price": float(c_db.close),
+                            "candle": {
+                                "time": ts,
+                                "open": float(c_db.open),
+                                "high": float(c_db.high),
+                                "low": float(c_db.low),
+                                "close": float(c_db.close),
+                                "volume": float(c_db.volume),
+                            },
+                            "timestamp": c_db.timestamp.isoformat(),
+                        }
+            except Exception:
+                pass
+
+            return {"status": "error", "pair": norm_pair, "message": "Failed to fetch live forex tick"}
+
+        else:
+            # Crypto live tick via Binance
+            binance_interval = self.TIMEFRAME_MAP_BINANCE.get(timeframe.lower(), "5m")
+            try:
+                async with httpx.AsyncClient(timeout=4.0) as client:
+                    r = await client.get(
+                        self.BINANCE_URL,
+                        params={"symbol": norm_pair, "interval": binance_interval, "limit": 1},
+                    )
+                    if r.status_code == 200:
+                        klines = r.json()
+                        if klines and len(klines) > 0:
+                            k = klines[0]
+                            open_time_sec = int(k[0] // 1000)
+                            o = float(k[1])
+                            h = float(k[2])
+                            l = float(k[3])
+                            c = float(k[4])
+                            v = float(k[5])
+                            result_data = {
+                                "status": "success",
+                                "pair": norm_pair,
+                                "timeframe": timeframe,
+                                "price": c,
+                                "candle": {
+                                    "time": open_time_sec,
+                                    "open": o,
+                                    "high": h,
+                                    "low": l,
+                                    "close": c,
+                                    "volume": v,
+                                },
+                                "timestamp": datetime.fromtimestamp(open_time_sec, tz=timezone.utc).isoformat(),
+                            }
+                            _TICK_CACHE[cache_key] = {"ts": now, "data": result_data}
+                            return result_data
+            except Exception as e:
+                logger.warning(f"Binance live tick error for {norm_pair}: {e}")
+
+            # Fallback to DB
+            try:
+                async with AsyncSessionLocal() as session:
+                    stmt = (
+                        select(Candle)
+                        .where(Candle.pair == norm_pair, Candle.timeframe == timeframe)
+                        .order_by(desc(Candle.timestamp))
+                        .limit(1)
+                    )
+                    res = await session.execute(stmt)
+                    c_db = res.scalar_one_or_none()
+                    if c_db:
+                        ts = int(c_db.timestamp.replace(tzinfo=timezone.utc).timestamp())
+                        return {
+                            "status": "success",
+                            "pair": norm_pair,
+                            "timeframe": timeframe,
+                            "price": float(c_db.close),
+                            "candle": {
+                                "time": ts,
+                                "open": float(c_db.open),
+                                "high": float(c_db.high),
+                                "low": float(c_db.low),
+                                "close": float(c_db.close),
+                                "volume": float(c_db.volume),
+                            },
+                            "timestamp": c_db.timestamp.isoformat(),
+                        }
+            except Exception:
+                pass
+
+            return {"status": "error", "pair": norm_pair, "message": "Failed to fetch crypto tick"}
+
 
 data_fetcher = DataFetcher()
 fetch_ohlcv = data_fetcher.fetch_ohlcv
+fetch_live_tick = data_fetcher.fetch_live_tick

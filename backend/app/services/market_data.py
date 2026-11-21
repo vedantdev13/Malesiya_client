@@ -88,6 +88,13 @@ class MarketDataService:
         from app.services.data_fetcher import data_fetcher
         return await data_fetcher.fetch_ohlcv(pair=pair, timeframe=timeframe, limit=limit)
 
+    async def fetch_live_tick(
+        self, pair: str, timeframe: str = "5m"
+    ) -> Dict[str, Any]:
+        """Fetch instantaneous live tick and active candle bar for real-time chart."""
+        from app.services.data_fetcher import data_fetcher
+        return await data_fetcher.fetch_live_tick(pair=pair, timeframe=timeframe)
+
     async def _fetch_binance_candles(
         self, symbol: str, timeframe: str, limit: int
     ) -> List[Dict[str, Any]]:

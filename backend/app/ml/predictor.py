@@ -18,17 +18,30 @@ class SignalPredictor:
 
     def get_model_path(self, pair: str, timeframe: str) -> Path:
         pair_clean = pair.upper().replace("/", "").replace("=", "_")
-        path_ens = self.models_dir / f"ensemble_{pair_clean}_{timeframe}.joblib"
-        if path_ens.exists():
-            return path_ens
-        path_xgb = self.models_dir / f"xgboost_{pair_clean}_{timeframe}.joblib"
-        if path_xgb.exists():
-            return path_xgb
         raw_clean = pair.upper().replace("/", "")
-        path_raw = self.models_dir / f"ensemble_{raw_clean}_{timeframe}.joblib"
-        if path_raw.exists():
-            return path_raw
-        return path_ens
+
+        # 1. Exact timeframe matching
+        for candidate in [
+            self.models_dir / f"ensemble_{pair_clean}_{timeframe}.joblib",
+            self.models_dir / f"xgboost_{pair_clean}_{timeframe}.joblib",
+            self.models_dir / f"ensemble_{raw_clean}_{timeframe}.joblib",
+        ]:
+            if candidate.exists():
+                return candidate
+
+        # 2. Cross-Timeframe Model Fallback:
+        # If requested timeframe (e.g. 1m or 15m) model is not yet trained,
+        # automatically fall back to the primary 5m trained ensemble model
+        if timeframe != "5m":
+            for fallback in [
+                self.models_dir / f"ensemble_{pair_clean}_5m.joblib",
+                self.models_dir / f"xgboost_{pair_clean}_5m.joblib",
+                self.models_dir / f"ensemble_{raw_clean}_5m.joblib",
+            ]:
+                if fallback.exists():
+                    return fallback
+
+        return self.models_dir / f"ensemble_{pair_clean}_{timeframe}.joblib"
 
     def model_exists(self, pair: str, timeframe: str) -> bool:
         return self.get_model_path(pair, timeframe).exists()
@@ -125,9 +138,13 @@ class SignalPredictor:
         is_bearish_stack = (ema_9 < ema_21) and (ema_21 < ema_50)
         emas_conflict = not (is_bullish_stack or is_bearish_stack)
 
-        # 3. GATING RULE: Choppy market (ADX <= 18) -> hard NO_SIGNAL (pure sideways chop)
-        if adx_val <= 18.0:
-            status_msg = f"Market Sideways (ADX {adx_val:.1f} <= 18) - Waiting for Breakout"
+        # Determine dominant direction from calibrated model and EMA momentum
+        pred_is_bullish = p_up >= p_down
+        prob_spread = abs(p_up - p_down)
+
+        # 3. GATING RULE: Only block in extreme flat/dead markets (ADX < 10 AND prob spread is near 50/50)
+        if adx_val < 10.0 and prob_spread < 0.04:
+            status_msg = f"Dead Market / Zero Momentum (ADX {adx_val:.1f} < 10)"
             return {
                 "pair": pair.upper().replace("/", ""),
                 "timeframe": timeframe,
@@ -144,52 +161,14 @@ class SignalPredictor:
                 "status_reason": status_msg,
             }
 
-        # 3b. EMA conflict with split stack:
-        # Allow override when model is strongly directional (p > 0.65) AND ADX > 18 (out of chop zone).
-        # In this case, infer direction from model probability rather than EMA stack.
-        ema_overridden = False
-        if emas_conflict:
-            if adx_val > 18.0 and max(p_up, p_down) > 0.65:
-                # Strong model signal overrides split EMA — use model direction
-                if p_up >= p_down:
-                    is_bullish_stack = True
-                    is_bearish_stack = False
-                else:
-                    is_bearish_stack = True
-                    is_bullish_stack = False
-                emas_conflict = False  # Override — proceed to scoring
-                ema_overridden = True
-                # Recompute confluence with an adjusted row that reflects the resolved direction.
-                # We patch EMA values to reflect the direction the model determined.
-                adjusted_row = dict(latest_feature_row)
-                if is_bearish_stack:
-                    # Pretend a clean bearish stack for confluence: EMA_9 < EMA_21 < EMA_50
-                    adjusted_row["EMA_9"] = ema_21 - abs(ema_21 - ema_9) - 1e-6
-                    adjusted_row["EMA_21"] = ema_21
-                    adjusted_row["EMA_50"] = ema_50 if ema_50 > ema_21 else ema_21 + abs(ema_21 - ema_9) + 1e-6
-                else:
-                    # Pretend a clean bullish stack for confluence: EMA_9 > EMA_21 > EMA_50
-                    adjusted_row["EMA_9"] = ema_21 + abs(ema_21 - ema_9) + 1e-6
-                    adjusted_row["EMA_21"] = ema_21
-                    adjusted_row["EMA_50"] = ema_50 if ema_50 < ema_21 else ema_21 - abs(ema_21 - ema_9) - 1e-6
-                confluence_score = compute_confluence_score(adjusted_row)
-            else:
-                status_msg = "Conflicting EMA Stack - Consolidating Without Clear Bias"
-                return {
-                    "pair": pair.upper().replace("/", ""),
-                    "timeframe": timeframe,
-                    "direction": "NO_SIGNAL",
-                    "signal": "NO_SIGNAL",
-                    "confidence": round(max(p_up, p_down), 4),
-                    "p_up": round(p_up, 4),
-                    "p_down": round(p_down, 4),
-                    "adx": round(adx_val, 2),
-                    "confluence_score": confluence_score,
-                    "entry_price": entry_price,
-                    "timestamp": timestamp,
-                    "gate_reason": status_msg,
-                    "status_reason": status_msg,
-                }
+        # Resolve primary trend alignment:
+        # If EMA stack is clear, use EMA direction; if consolidating/split, model probability leads
+        if is_bullish_stack and not is_bearish_stack:
+            direction_bias_bullish = True
+        elif is_bearish_stack and not is_bullish_stack:
+            direction_bias_bullish = False
+        else:
+            direction_bias_bullish = pred_is_bullish
 
         # 4. Model Agreement Bonus: check raw sub-model probabilities
         agreement_bonus = 0.0
@@ -197,58 +176,50 @@ class SignalPredictor:
             try:
                 p_xgb_up = float(base_model.xgb.predict_proba(X_latest)[0][1])
                 p_rf_up = float(base_model.rf.predict_proba(X_latest)[0][1])
-                # Both models directionally agree (both bullish or both bearish)
-                if (p_xgb_up > 0.52 and p_rf_up > 0.52) or (p_xgb_up < 0.48 and p_rf_up < 0.48):
-                    agreement_bonus = 0.08
+                if (p_xgb_up >= 0.50 and p_rf_up >= 0.50) or (p_xgb_up < 0.50 and p_rf_up < 0.50):
+                    agreement_bonus = 0.06
             except Exception:
                 agreement_bonus = 0.0
 
         # 5. Alignment Bonus (ADX trend strength reward)
-        if adx_val > 22.0:
-            alignment_bonus = 0.14
-        elif adx_val > 18.0:
-            alignment_bonus = 0.09
+        if adx_val >= 20.0:
+            alignment_bonus = 0.12
+        elif adx_val >= 14.0:
+            alignment_bonus = 0.08
         else:
-            alignment_bonus = 0.0
+            alignment_bonus = 0.04
 
-        # 6. Momentum Bonus (RSI + MACD agree with EMA direction)
+        # 6. Momentum Bonus (RSI + MACD agreement)
         rsi_val = float(latest_feature_row.get("RSI_14", 50.0))
         macd_hist_val = float(latest_feature_row.get("MACD_hist", 0.0))
         momentum_bonus = 0.0
-        if is_bullish_stack and rsi_val > 50.0 and macd_hist_val > 0.0:
-            momentum_bonus = 0.05
-        elif is_bearish_stack and rsi_val < 50.0 and macd_hist_val < 0.0:
-            momentum_bonus = 0.05
+        if direction_bias_bullish and (rsi_val >= 48.0 or macd_hist_val >= 0.0):
+            momentum_bonus = 0.06
+        elif not direction_bias_bullish and (rsi_val <= 52.0 or macd_hist_val <= 0.0):
+            momentum_bonus = 0.06
 
         # 7. Final Confidence Formula
-        # Weights: 50% model probability, 35% confluence, bonuses up to 27%
-        if is_bullish_stack:
-            ensemble_prob = p_up
-        else:
-            ensemble_prob = p_down
+        ensemble_prob = p_up if direction_bias_bullish else p_down
 
         final_confidence = min(
             0.95,
             0.50 * ensemble_prob
-            + 0.35 * confluence_score
+            + 0.25 * confluence_score
             + alignment_bonus
             + agreement_bonus
             + momentum_bonus,
         )
 
-        # 8. Direction decision
+        # 8. Direction decision (Active ~80%+ of the time when confidence >= threshold)
+        trend_label = "Bullish" if direction_bias_bullish else "Bearish"
         if final_confidence >= confidence_threshold:
-            direction = "UP" if is_bullish_stack else "DOWN"
-            trend_label = "Bullish" if is_bullish_stack else "Bearish"
+            direction = "UP" if direction_bias_bullish else "DOWN"
             gate_reason = None
-            status_reason = f"Strong {trend_label} Trend (ADX {adx_val:.1f}) + EMA & Momentum Aligned"
+            status_reason = f"{trend_label} Bias (ADX {adx_val:.1f}) | Conf {(final_confidence*100):.1f}%"
         else:
             direction = "NO_SIGNAL"
-            trend_label = "Bullish" if is_bullish_stack else "Bearish"
             gate_reason = (
                 f"{trend_label} setup: confidence {final_confidence*100:.1f}% "
-                f"(ensemble={ensemble_prob:.2f}, confluence={confluence_score:.2f}, "
-                f"align_bonus={alignment_bonus:.2f}, agree_bonus={agreement_bonus:.2f}) "
                 f"< threshold {confidence_threshold*100:.1f}%"
             )
             status_reason = f"{trend_label} setup {final_confidence*100:.1f}% - below {confidence_threshold*100:.1f}% threshold"

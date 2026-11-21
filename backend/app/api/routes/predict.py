@@ -1,7 +1,9 @@
 import asyncio
+import logging
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 import pandas as pd
 from sqlalchemy import desc, select
@@ -14,6 +16,8 @@ from app.models.schema import Candle, Signal
 from app.schemas.signal import SignalResponse
 from app.services.market_data import market_data_service
 from app.api.websockets import ws_manager
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/predict", tags=["ML Predictions & Signals"])
 
@@ -39,26 +43,151 @@ async def _bg_sync_candles(pair: str, timeframe: str, candles: List[Dict[str, An
         pass
 
 
+PRIORITY_FOREX_PAIRS = ["EURUSD=X", "GBPUSD=X", "USDJPY=X"]
+PRIORITY_CRYPTO_PAIRS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+
+
+async def _train_single_suite_pair(pair: str, timeframe: str, limit: int) -> Dict[str, Any]:
+    norm_pair = market_data_service.normalize_pair(pair)
+    fetched = await market_data_service.fetch_candles(pair=norm_pair, timeframe=timeframe, limit=limit)
+    if not fetched or len(fetched) < 50:
+        raise ValueError(f"Insufficient candles ({len(fetched) if fetched else 0}) for {norm_pair}")
+
+    df = pd.DataFrame(fetched)
+    features_df = extract_features(df)
+    train_res = await asyncio.to_thread(
+        train_tuned_model,
+        features_df,
+        target_horizon=3,
+        pair=norm_pair,
+        timeframe=timeframe,
+    )
+    predictor.load_model(norm_pair, timeframe, force_reload=True)
+    return {
+        "pair": norm_pair,
+        "candles_used": len(df),
+        "test_samples": train_res.get("test_samples"),
+        "test_accuracy": train_res.get("test_accuracy"),
+        "high_confidence_accuracy": train_res.get("high_confidence_accuracy"),
+        "high_confidence_sample_count": train_res.get("high_confidence_sample_count"),
+        "model_file": train_res.get("model_file"),
+    }
+
+
+@router.post("/train-primary-fx")
+async def train_primary_fx_endpoint(
+    timeframe: str = Query(default="5m", description="Primary timeframe to train Forex models on"),
+) -> Dict[str, Any]:
+    """
+    Train and calibrate the 3 Primary Quotex Forex pairs on 60,000 real bars total:
+    - EURUSD=X (20,000 real bars)
+    - GBPUSD=X (20,000 real bars)
+    - USDJPY=X (20,000 real bars)
+    Total: 60,000 real Forex bars trained with 0.15 * ATR sensitivity.
+    """
+    t0 = time.time()
+    results = []
+    total_candles = 0
+
+    for p in PRIORITY_FOREX_PAIRS:
+        try:
+            r = await _train_single_suite_pair(p, timeframe, limit=20000)
+            results.append({"status": "success", "category": "Forex", **r})
+            total_candles += r["candles_used"]
+        except Exception as e:
+            logger.error(f"Primary FX training failed for {p}: {e}")
+            results.append({"status": "failed", "category": "Forex", "pair": p, "error": str(e)})
+
+    elapsed = time.time() - t0
+    return {
+        "status": "success",
+        "message": f"Successfully trained Primary Forex Suite on {total_candles:,} real bars across 3 pairs in {elapsed:.1f}s",
+        "timeframe": timeframe,
+        "total_candles": total_candles,
+        "category": "Forex",
+        "elapsed_seconds": round(elapsed, 2),
+        "results": results,
+    }
+
+
+@router.post("/train-secondary-crypto")
+async def train_secondary_crypto_endpoint(
+    timeframe: str = Query(default="5m", description="Primary timeframe to train Crypto models on"),
+) -> Dict[str, Any]:
+    """
+    Train and calibrate the 3 Secondary Crypto pairs on 40,000 real bars total:
+    - BTCUSDT (13,334 real bars)
+    - ETHUSDT (13,334 real bars)
+    - SOLUSDT (13,334 real bars)
+    Total: ~40,002 real Crypto bars trained with 0.25 * ATR sensitivity.
+    """
+    t0 = time.time()
+    results = []
+    total_candles = 0
+
+    for p in PRIORITY_CRYPTO_PAIRS:
+        try:
+            r = await _train_single_suite_pair(p, timeframe, limit=13334)
+            results.append({"status": "success", "category": "Crypto", **r})
+            total_candles += r["candles_used"]
+        except Exception as e:
+            logger.error(f"Secondary Crypto training failed for {p}: {e}")
+            results.append({"status": "failed", "category": "Crypto", "pair": p, "error": str(e)})
+
+    elapsed = time.time() - t0
+    return {
+        "status": "success",
+        "message": f"Successfully trained Secondary Crypto Suite on {total_candles:,} real bars across 3 pairs in {elapsed:.1f}s",
+        "timeframe": timeframe,
+        "total_candles": total_candles,
+        "category": "Crypto",
+        "elapsed_seconds": round(elapsed, 2),
+        "results": results,
+    }
+
+
+@router.post("/train-priority-suite")
+async def train_priority_suite_endpoint(
+    timeframe: str = Query(default="5m", description="Primary timeframe to train suite on (e.g. 5m)"),
+) -> Dict[str, Any]:
+    """Train both Primary FX (60k) and Secondary Crypto (40k) = 100k total."""
+    fx_res = await train_primary_fx_endpoint(timeframe=timeframe)
+    crypto_res = await train_secondary_crypto_endpoint(timeframe=timeframe)
+    total_c = fx_res.get("total_candles", 0) + crypto_res.get("total_candles", 0)
+    return {
+        "status": "success",
+        "message": f"100k Suite Trained: {total_c:,} real bars ({fx_res.get('total_candles',0):,} FX + {crypto_res.get('total_candles',0):,} Crypto)",
+        "timeframe": timeframe,
+        "total_candles": total_c,
+        "forex_candles": fx_res.get("total_candles", 0),
+        "crypto_candles": crypto_res.get("total_candles", 0),
+        "results": fx_res.get("results", []) + crypto_res.get("results", []),
+    }
+
+
 @router.post("/train")
 async def train_model_endpoint(
-    pair: str = Query(default="BTCUSDT", description="Asset pair e.g. BTCUSDT or EURUSD=X"),
+    pair: str = Query(default="EURUSD=X", description="Asset pair e.g. EURUSD=X or BTCUSDT"),
     timeframe: str = Query(default="5m", description="Candle timeframe e.g. 5m"),
-    limit: int = Query(default=25000, ge=100, le=50000, description="Real historical candles count (up to 25000)"),
+    limit: Optional[int] = Query(default=None, description="Candle count (defaults: 20,000 for Forex, 13,334 for Crypto)"),
     db: AsyncSession = Depends(get_db),
 ) -> Dict[str, Any]:
     """
-    Fetch up to 25,000 real historical bars from Binance/yfinance, compute feature matrix,
+    Fetch real historical bars from Binance/yfinance, compute feature matrix,
     train heavily regularized & pruned soft-voting Ensemble (XGBoost + RandomForest) with:
     - 3-bar directional horizon (Close(t+3) > Close(t))
-    - Strict 0.30 * ATR noise filter
+    - Dynamic noise filter (0.15 * ATR for Forex, 0.25 * ATR for Crypto)
     - Strict chronological 70% Train : 10% Validation : 20% Test split
-    - Multi-core n_jobs=-1 execution (~3-4s model fit)
+    - Multi-core n_jobs=-1 execution
     - Sigmoid probability calibration on 10% validation set
     - Final out-of-sample test accuracy and high-confidence precision evaluated on untouched 20% test set
     """
     norm_pair = market_data_service.normalize_pair(pair)
+    is_forex = market_data_service.is_forex(norm_pair)
+    if limit is None:
+        limit = 20000 if is_forex else 13334
 
-    # Fetch fresh real historical market data up to limit (up to 25,000 bars)
+    # Fetch fresh real historical market data up to limit
     fetched = await market_data_service.fetch_candles(
         pair=norm_pair, timeframe=timeframe, limit=limit
     )
@@ -116,10 +245,10 @@ async def train_model_endpoint(
 
 @router.get("/signal", response_model=SignalResponse)
 async def get_trading_signal(
-    pair: str = Query(default="BTCUSDT", description="Asset pair e.g. BTCUSDT or EURUSD=X"),
+    pair: str = Query(default="EURUSD=X", description="Asset pair e.g. EURUSD=X or BTCUSDT"),
     timeframe: str = Query(default="5m", description="Candle timeframe e.g. 5m"),
     confidence_threshold: float = Query(
-        default=0.75, ge=0.5, le=0.98, description="Confidence threshold for UP/DOWN signal (default 0.75)"
+        default=0.60, ge=0.5, le=0.98, description="Confidence threshold for UP/DOWN signal (default 0.60)"
     ),
     db: AsyncSession = Depends(get_db),
 ) -> Any:
@@ -256,13 +385,14 @@ async def get_trading_signal(
     return signal_record
 
 
-PAIRS_TO_SCAN = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "EURUSD=X", "GBPUSD=X"]
+PAIRS_TO_SCAN = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "EURUSD=X", "GBPUSD=X", "USDJPY=X"]
 PAIR_LABELS = {
     "BTCUSDT": "BTC/USDT",
     "ETHUSDT": "ETH/USDT",
     "SOLUSDT": "SOL/USDT",
     "EURUSD=X": "EUR/USD",
     "GBPUSD=X": "GBP/USD",
+    "USDJPY=X": "USD/JPY",
 }
 
 
@@ -339,12 +469,12 @@ async def _scan_single_pair(pair: str, timeframe: str, threshold: float) -> Dict
 async def scan_all_opportunities(
     timeframe: str = Query(default="5m", description="Candle timeframe e.g. 5m"),
     threshold: float = Query(
-        default=0.75, ge=0.5, le=0.98, description="Confidence threshold (default 0.75)"
+        default=0.60, ge=0.5, le=0.98, description="Confidence threshold (default 0.60)"
     ),
 ) -> Dict[str, Any]:
     """
-    Run fast concurrent inference across all 5 core pairs:
-    BTCUSDT, ETHUSDT, SOLUSDT, EURUSD=X, GBPUSD=X.
+    Run fast concurrent inference across all 6 core pairs:
+    BTCUSDT, ETHUSDT, SOLUSDT, EURUSD=X, GBPUSD=X, USDJPY=X.
     Returns ranked list sorted by actionable signal & confidence descending.
     """
     tasks = [_scan_single_pair(p, timeframe, threshold) for p in PAIRS_TO_SCAN]

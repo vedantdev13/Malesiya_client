@@ -1,12 +1,13 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { createChart } from 'lightweight-charts';
-import { fetchCandles } from '../services/api';
-import { RefreshCw, TrendingUp, TrendingDown, Maximize2 } from 'lucide-react';
+import { fetchCandles, fetchLiveTick } from '../services/api';
+import { RefreshCw, TrendingUp, TrendingDown, Maximize2, Radio } from 'lucide-react';
 
 export default function TradingChart({ pair, timeframe, onPriceUpdate }) {
   const chartContainerRef = useRef(null);
   const chartInstanceRef = useRef(null);
   const seriesRef = useRef(null);
+  const firstCandleOpenRef = useRef(null);
 
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -49,6 +50,7 @@ export default function TradingChart({ pair, timeframe, onPriceUpdate }) {
 
           const latest = unique[unique.length - 1];
           setCurrentCandle(latest);
+          firstCandleOpenRef.current = unique[0].open;
 
           const highs = unique.map((c) => c.high);
           const lows = unique.map((c) => c.low);
@@ -88,6 +90,17 @@ export default function TradingChart({ pair, timeframe, onPriceUpdate }) {
     }
 
     const container = chartContainerRef.current;
+
+    // Local timezone formatter — auto-detects browser timezone (MYT UTC+8 for Malaysia, etc.)
+    const fmtTime = (unixSec) => {
+      const d = new Date(unixSec * 1000);
+      return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
+    };
+    const fmtDate = (unixSec) => {
+      const d = new Date(unixSec * 1000);
+      return d.toLocaleDateString([], { month: 'short', day: 'numeric' });
+    };
+
     const chart = createChart(container, {
       width: container.clientWidth,
       height: container.clientHeight || 480,
@@ -96,6 +109,16 @@ export default function TradingChart({ pair, timeframe, onPriceUpdate }) {
         textColor: '#D1D5DB',
         fontSize: 11,
         fontFamily: "'JetBrains Mono', monospace",
+      },
+      localization: {
+        // Format crosshair & price labels in local browser timezone
+        timeFormatter: (unixSec) => {
+          const d = new Date(unixSec * 1000);
+          return d.toLocaleString([], {
+            month: 'short', day: 'numeric',
+            hour: '2-digit', minute: '2-digit', hour12: false,
+          });
+        },
       },
       grid: {
         vertLines: { color: '#2A3447', style: 1 },
@@ -120,6 +143,12 @@ export default function TradingChart({ pair, timeframe, onPriceUpdate }) {
         borderColor: '#2A3447',
         timeVisible: true,
         secondsVisible: false,
+        // Tick labels on axis in local timezone
+        tickMarkFormatter: (unixSec, tickMarkType) => {
+          // TickMarkType: 0=Year,1=Month,2=DayOfMonth,3=Time,4=TimeWithSeconds
+          if (tickMarkType <= 2) return fmtDate(unixSec);
+          return fmtTime(unixSec);
+        },
       },
       rightPriceScale: {
         borderColor: '#2A3447',
@@ -176,7 +205,42 @@ export default function TradingChart({ pair, timeframe, onPriceUpdate }) {
     // Initial load
     loadData();
 
+    // Real-Time Moving Chart Candles (zero refresh - updates active bar dynamically every 2s)
+    let isCancelled = false;
+    const pollTick = async () => {
+      if (isCancelled || !seriesRef.current) return;
+      try {
+        const res = await fetchLiveTick(pair, timeframe);
+        if (isCancelled || !res || !res.candle || !seriesRef.current) return;
+        const candle = {
+          time: Number(res.candle.time),
+          open: Number(res.candle.open),
+          high: Number(res.candle.high),
+          low: Number(res.candle.low),
+          close: Number(res.candle.close),
+        };
+        seriesRef.current.update(candle);
+        setCurrentCandle(candle);
+        setCandleStats((prev) => ({
+          high: Math.max(prev.high || 0, candle.high),
+          low: prev.low ? Math.min(prev.low, candle.low) : candle.low,
+          volume: prev.volume,
+        }));
+        if (onPriceUpdate) {
+          const firstOpen = firstCandleOpenRef.current;
+          const chg = firstOpen ? ((candle.close - firstOpen) / firstOpen) * 100 : 0;
+          onPriceUpdate(candle.close, chg);
+        }
+      } catch (err) {
+        // Silently continue polling
+      }
+    };
+
+    const tickInterval = setInterval(pollTick, 1000);
+
     return () => {
+      isCancelled = true;
+      clearInterval(tickInterval);
       resizeObserver.disconnect();
       if (chartInstanceRef.current) {
         chartInstanceRef.current.remove();
@@ -199,6 +263,15 @@ export default function TradingChart({ pair, timeframe, onPriceUpdate }) {
             <span className="text-[#9CA3AF] text-xs font-normal">
               [{timeframe}]
             </span>
+          </div>
+
+          {/* Dynamic Real-Time Moving Candle Pulse */}
+          <div className="hidden sm:flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-[#0B0E14] border border-[#10B981]/30">
+            <span className="relative flex h-2 w-2">
+              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-[#10B981] opacity-75"></span>
+              <span className="relative inline-flex rounded-full h-2 w-2 bg-[#10B981]"></span>
+            </span>
+            <span className="text-[10px] font-semibold text-[#10B981] tracking-wider">LIVE 1S</span>
           </div>
 
           {currentCandle && (

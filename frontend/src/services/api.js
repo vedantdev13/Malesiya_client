@@ -30,17 +30,38 @@ export const fetchFeatures = async (pair = 'BTCUSDT', timeframe = '1m') => {
   return response.data;
 };
 
-export const trainModel = async (pair = 'BTCUSDT', timeframe = '5m', limit = 25000) => {
+export const trainModel = async (pair = 'EURUSD=X', timeframe = '5m', limit = 20000) => {
   const response = await api.post('/predict/train', null, {
     params: { pair, timeframe, limit },
   });
   return response.data;
 };
 
+export const trainPrimaryFx = async (timeframe = '5m') => {
+  const response = await api.post('/predict/train-primary-fx', null, {
+    params: { timeframe },
+  });
+  return response.data;
+};
+
+export const trainSecondaryCrypto = async (timeframe = '5m') => {
+  const response = await api.post('/predict/train-secondary-crypto', null, {
+    params: { timeframe },
+  });
+  return response.data;
+};
+
+export const trainPrioritySuite = async (timeframe = '5m') => {
+  const response = await api.post('/predict/train-priority-suite', null, {
+    params: { timeframe },
+  });
+  return response.data;
+};
+
 export const generateSignal = async (
-  pair = 'BTCUSDT',
-  timeframe = '1m',
-  confidenceThreshold = 0.75
+  pair = 'EURUSD=X',
+  timeframe = '5m',
+  confidenceThreshold = 0.60
 ) => {
   const response = await api.get('/predict/signal', {
     params: { pair, timeframe, confidence_threshold: confidenceThreshold },
@@ -55,9 +76,16 @@ export const fetchPerformance = async (pair, timeframe) => {
   return response.data;
 };
 
-export const scanAllOpportunities = async (timeframe = '5m', threshold = 0.75) => {
+export const scanAllOpportunities = async (timeframe = '5m', threshold = 0.60) => {
   const response = await api.get('/predict/scan-all', {
     params: { timeframe, threshold },
+  });
+  return response.data;
+};
+
+export const fetchLiveTick = async (pair = 'BTCUSDT', timeframe = '5m') => {
+  const response = await api.get('/data/live-tick', {
+    params: { pair, timeframe },
   });
   return response.data;
 };

@@ -89,16 +89,18 @@ def train_tuned_model(
     work_df["close_next"] = work_df["close"].shift(-target_horizon)
     work_df["target"] = (work_df["close_next"] > work_df["close"]).astype(int)
 
-    # 2. Strict noise filter: drop flat dead-zone candles where move < 0.30 * ATR_14
+    # 2. Strict noise filter: scale dead-zone to 0.15 * ATR for Forex, 0.25 * ATR for Crypto
+    is_forex = pair.upper().endswith("=X") or any(fx in pair.upper() for fx in ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD"])
+    atr_multiplier = 0.15 if is_forex else 0.25
     work_df["move_size"] = (work_df["close_next"] - work_df["close"]).abs()
     if "ATR_14" in work_df.columns:
-        dead_zone_threshold = 0.30 * work_df["ATR_14"]
+        dead_zone_threshold = atr_multiplier * work_df["ATR_14"]
         pre_count = len(work_df)
         work_df = work_df[work_df["move_size"] >= dead_zone_threshold]
         post_count = len(work_df)
         logger.info(
-            f"Strict noise filter (0.30 * ATR) removed {pre_count - post_count} dead-zone candles "
-            f"({pre_count} -> {post_count} active trending bars)"
+            f"Strict noise filter ({atr_multiplier:.2f} * ATR for {'Forex' if is_forex else 'Crypto'}) removed "
+            f"{pre_count - post_count} dead-zone candles ({pre_count} -> {post_count} active trending bars)"
         )
 
     # Drop trailing rows without horizon target and any remaining NaN

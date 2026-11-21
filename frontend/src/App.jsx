@@ -2,7 +2,16 @@ import React, { useState, useEffect, useCallback, useRef } from 'react';
 import Header from './components/Header';
 import TradingChart from './components/TradingChart';
 import PerformanceBar from './components/PerformanceBar';
-import { checkHealth, WS_BASE_URL, generateSignal, trainModel, scanAllOpportunities } from './services/api';
+import {
+  checkHealth,
+  WS_BASE_URL,
+  generateSignal,
+  trainModel,
+  trainPrimaryFx,
+  trainSecondaryCrypto,
+  trainPrioritySuite,
+  scanAllOpportunities,
+} from './services/api';
 import { useWebSocket } from './hooks/useWebSocket';
 import {
   Zap,
@@ -28,17 +37,18 @@ const isSamePair = (p1, p2) => {
 };
 
 export default function App() {
-  const [selectedPair, setSelectedPair]           = useState('BTCUSDT');
+  const [selectedPair, setSelectedPair]           = useState('EURUSD=X');
   const [selectedTimeframe, setSelectedTimeframe] = useState('5m');
   const [isBackendConnected, setIsBackendConnected] = useState(false);
   const [lastPrice, setLastPrice]                 = useState(null);
   const [priceChange, setPriceChange]             = useState(0);
-  const [confidenceThreshold, setConfidenceThreshold] = useState(0.75);
+  const [confidenceThreshold, setConfidenceThreshold] = useState(0.60);
 
   const [activeSignal, setActiveSignal]           = useState(null);
   const [signalHistory, setSignalHistory]         = useState([]);
   const [isGeneratingSignal, setIsGeneratingSignal] = useState(false);
-  const [isTraining, setIsTraining]               = useState(false);
+  const [isTrainingFx, setIsTrainingFx]           = useState(false);
+  const [isTrainingCrypto, setIsTrainingCrypto]   = useState(false);
   const [actionNotice, setActionNotice]           = useState(null);
   const [perfRefreshKey, setPerfRefreshKey]       = useState(0);
 
@@ -182,32 +192,53 @@ export default function App() {
     }
   };
 
-  // ─── Model training ──────────────────────────────────────────────────────
-  const handleTrainModel = async () => {
-    setIsTraining(true);
+  // ─── Primary FX Training (60,000 Bars: EUR/USD, GBP/USD, USD/JPY) ────────
+  const handleTrainPrimaryFx = async () => {
+    setIsTrainingFx(true);
     setActionNotice(null);
     try {
-      const res = await trainModel(selectedPair, selectedTimeframe, 25000);
-      const testAcc = res.test_accuracy ? (res.test_accuracy * 100).toFixed(1) : ((res.accuracy || 0) * 100).toFixed(1);
-      const hcPct = res.high_confidence_accuracy ? (res.high_confidence_accuracy * 100).toFixed(1) : '85+';
-      const hcCount = res.high_confidence_sample_count || 0;
+      const res = await trainPrimaryFx(selectedTimeframe);
       setActionNotice({
         type: 'success',
-        text: `Pruned Ensemble (70:10:20 Split) | Train: ${res.train_samples} Val: ${res.val_samples} Test: ${res.test_samples} | Test Acc: ${testAcc}% | High-Conf: ${hcPct}% (${hcCount} signals)`,
+        text: `Primary Forex Suite (60,000 Bars) Trained! ${res.total_candles?.toLocaleString()} real bars saved in ${res.elapsed_seconds}s.`,
       });
+      setPerfRefreshKey(k => k + 1);
+      handleScanAll();
     } catch (err) {
       setActionNotice({
         type: 'error',
-        text: 'Training error: ' + (err.response?.data?.detail || err.message),
+        text: 'Primary FX training error: ' + (err.response?.data?.detail || err.message),
       });
     } finally {
-      setIsTraining(false);
+      setIsTrainingFx(false);
+    }
+  };
+
+  // ─── Secondary Crypto Training (40,000 Bars: BTC, ETH, SOL) ──────────────
+  const handleTrainSecondaryCrypto = async () => {
+    setIsTrainingCrypto(true);
+    setActionNotice(null);
+    try {
+      const res = await trainSecondaryCrypto(selectedTimeframe);
+      setActionNotice({
+        type: 'success',
+        text: `Secondary Crypto Suite (40,000 Bars) Trained! ${res.total_candles?.toLocaleString()} real bars saved in ${res.elapsed_seconds}s.`,
+      });
+      setPerfRefreshKey(k => k + 1);
+      handleScanAll();
+    } catch (err) {
+      setActionNotice({
+        type: 'error',
+        text: 'Crypto training error: ' + (err.response?.data?.detail || err.message),
+      });
+    } finally {
+      setIsTrainingCrypto(false);
     }
   };
 
   // ─── Precision mode label ────────────────────────────────────────────────
   const thresholdPct = Math.round(confidenceThreshold * 100);
-  const isHighPrecision = thresholdPct >= 80;
+  const isHighPrecision = thresholdPct >= 75;
 
   // ─── Decimal precision per asset ────────────────────────────────────────
   const getDecimals = (pair) => {
@@ -341,13 +372,32 @@ export default function App() {
                 <span>{isGeneratingSignal ? 'Analyzing...' : 'Run Signal Inference'}</span>
               </button>
 
+              {/* Primary Quotex Forex Training Button (60k Bars) */}
               <button
-                onClick={handleTrainModel}
-                disabled={isTraining}
-                className="w-full flex items-center justify-center gap-2 py-2 px-4 bg-[#0B0E14] hover:bg-[#1A2332] border border-[#2A3447] hover:border-[#3B4861] text-[#9CA3AF] hover:text-white font-medium text-xs rounded-lg transition-all disabled:opacity-50"
+                onClick={handleTrainPrimaryFx}
+                disabled={isTrainingFx || isTrainingCrypto}
+                className="w-full flex items-center justify-center gap-2 py-2 px-3 bg-[#0B0E14] hover:bg-[#121E19] border border-[#10B981]/50 hover:border-[#10B981] text-[#10B981] font-semibold text-xs rounded-lg transition-all shadow-sm shadow-[#10B981]/5 disabled:opacity-50"
               >
-                <Cpu className={`w-3.5 h-3.5 ${isTraining ? 'animate-spin text-[#3B82F6]' : ''}`} />
-                <span>{isTraining ? 'Training on 25,000 Real Bars (~6–8s)...' : 'Tune Model (25,000 Real Bars)'}</span>
+                <Cpu className={`w-3.5 h-3.5 ${isTrainingFx ? 'animate-spin text-[#10B981]' : ''}`} />
+                <span>
+                  {isTrainingFx
+                    ? 'Training Primary FX (60,000 Bars)...'
+                    : 'Train Primary FX (60,000 Bars)'}
+                </span>
+              </button>
+
+              {/* Secondary Crypto Training Button (40k Bars) */}
+              <button
+                onClick={handleTrainSecondaryCrypto}
+                disabled={isTrainingFx || isTrainingCrypto}
+                className="w-full flex items-center justify-center gap-2 py-2 px-3 bg-[#0B0E14] hover:bg-[#1A2332] border border-[#2A3447] hover:border-[#3B82F6]/50 text-[#9CA3AF] hover:text-[#93C5FD] font-medium text-xs rounded-lg transition-all disabled:opacity-50"
+              >
+                <Cpu className={`w-3.5 h-3.5 ${isTrainingCrypto ? 'animate-spin text-[#3B82F6]' : ''}`} />
+                <span>
+                  {isTrainingCrypto
+                    ? 'Training Crypto (40,000 Bars)...'
+                    : 'Train Secondary Crypto (40,000 Bars)'}
+                </span>
               </button>
             </div>
 
@@ -435,7 +485,7 @@ export default function App() {
               )}
             </div>
 
-            {/* Live Opportunity Scanner (All 5 Pairs) */}
+            {/* Live Opportunity Scanner (All 6 Pairs) */}
             <div className="bg-[#151D2A] border border-[#2A3447] rounded-xl p-4 flex flex-col gap-3 shadow-lg">
               <div className="flex items-center justify-between pb-2 border-b border-[#2A3447]">
                 <div className="flex items-center gap-2">
@@ -458,7 +508,7 @@ export default function App() {
                     onClick={() => handleScanAll()}
                     disabled={isScanning}
                     className="p-1 rounded hover:bg-[#0B0E14] text-[#9CA3AF] hover:text-white transition-colors"
-                    title="Scan all 5 pairs now"
+                    title="Scan all 6 pairs now"
                   >
                     <RefreshCw className={`w-3.5 h-3.5 ${isScanning ? 'animate-spin text-[#10B981]' : ''}`} />
                   </button>
@@ -500,7 +550,7 @@ export default function App() {
                             <span
                               className={`px-2 py-0.5 rounded text-[10px] font-bold flex items-center gap-1 ${
                                 opp.signal === 'UP'
-                                  ? 'bg-[#10B981]/20 text-[#10B981] border border-[#10B981]/40'
+                                    ? 'bg-[#10B981]/20 text-[#10B981] border border-[#10B981]/40'
                                   : opp.signal === 'DOWN'
                                   ? 'bg-[#EF4444]/20 text-[#EF4444] border border-[#EF4444]/40'
                                   : 'bg-[#2A3447]/60 text-[#9CA3AF]'
@@ -526,7 +576,7 @@ export default function App() {
                   })
                 ) : (
                   <div className="py-4 text-center text-[#6B7280] text-xs">
-                    {isScanning ? 'Scanning all 5 pairs...' : 'Click below to scan all 5 pairs'}
+                    {isScanning ? 'Scanning all 6 pairs...' : 'Click below to scan all 6 pairs'}
                   </div>
                 )}
               </div>
@@ -537,7 +587,7 @@ export default function App() {
                 className="w-full flex items-center justify-center gap-2 py-1.5 px-3 bg-[#0B0E14] hover:bg-[#1E293B] border border-[#2A3447] hover:border-[#10B981]/40 text-xs font-semibold text-[#10B981] rounded-lg transition-all disabled:opacity-50"
               >
                 <RefreshCw className={`w-3.5 h-3.5 ${isScanning ? 'animate-spin' : ''}`} />
-                <span>{isScanning ? 'Scanning All 5 Pairs...' : 'Scan All 5 Pairs (Instant)'}</span>
+                <span>{isScanning ? 'Scanning All 6 Pairs...' : 'Scan All 6 Pairs (Instant)'}</span>
               </button>
             </div>
 

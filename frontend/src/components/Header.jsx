@@ -24,9 +24,9 @@ export default function Header({
   const timeframes = ['1m', '5m', '15m'];
 
   const thresholdPct = Math.round(confidenceThreshold * 100);
-  const isHighPrecision = thresholdPct >= 80;
-  const isBalancedPro = thresholdPct >= 72 && thresholdPct < 80;
-  const isMedium = thresholdPct >= 65 && thresholdPct < 72;
+  const isHighPrecision = thresholdPct >= 75;
+  const isBalancedPro = thresholdPct >= 60 && thresholdPct < 75;
+  const isMedium = thresholdPct < 60;
 
   return (
     <header className="bg-[#151D2A] border-b border-[#2A3447] px-4 py-3 sm:px-6">
@@ -144,8 +144,8 @@ export default function Header({
               </div>
               <input
                 type="range"
-                min="50"
-                max="95"
+                min="55"
+                max="90"
                 step="1"
                 value={thresholdPct}
                 onChange={(e) => onConfidenceChange(Number(e.target.value) / 100)}

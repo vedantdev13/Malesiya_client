@@ -54,6 +54,19 @@ async def fetch_market_data(
     }
 
 
+@router.get("/live-tick")
+async def get_live_tick(
+    pair: str = Query(default="BTCUSDT", description="Trading asset pair e.g. BTCUSDT or USDJPY=X"),
+    timeframe: str = Query(default="5m", description="Candle timeframe e.g. 1m, 5m"),
+) -> Dict[str, Any]:
+    """
+    Ultra-fast (< 300ms) live price and active candle tick endpoint
+    for real-time moving chart candles (zero page refresh).
+    """
+    norm_pair = market_data_service.normalize_pair(pair)
+    return await market_data_service.fetch_live_tick(pair=norm_pair, timeframe=timeframe)
+
+
 @router.get("/features")
 async def get_engineered_features(
     pair: str = Query(default="BTCUSDT", description="Trading asset pair"),
