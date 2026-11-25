@@ -30,7 +30,6 @@ class CandleResponse(CandleBase):
 
 
 # Signal Schemas
-SignalDirection = Literal["UP", "DOWN", "NO_SIGNAL"]
 SignalStatus = Literal["PENDING", "WIN", "LOSS", "DRAW"]
 
 
@@ -39,18 +38,24 @@ class SignalBase(BaseModel):
     timeframe: str
     timestamp: datetime = Field(default_factory=get_utc_now)
     expiry_timestamp: datetime
-    direction: SignalDirection
+    direction: str  # "UP", "DOWN", "NO_SIGNAL", "UP (CALL)", "DOWN (PUT)"
     confidence: float = Field(ge=0.0, le=1.0)
     entry_price: float
     exit_price: Optional[float] = None
     status: SignalStatus = "PENDING"
+    next_candle_entry_in_sec: Optional[int] = None
+    entry_instruction: Optional[str] = None
+    confluence_score: Optional[float] = None
+    status_reason: Optional[str] = None
+    gate_reason: Optional[str] = None
+    call_put: Optional[str] = None
 
 
 class SignalCreate(BaseModel):
     pair: str
     timeframe: str
     expiry_timestamp: datetime
-    direction: SignalDirection
+    direction: str
     confidence: float = Field(ge=0.0, le=1.0)
     entry_price: float
     timestamp: Optional[datetime] = None

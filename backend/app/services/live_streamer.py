@@ -1,8 +1,6 @@
 import asyncio
 from datetime import datetime, timezone
-import json
 import logging
-import random
 import time
 from typing import Any, Dict, Optional
 import httpx
@@ -11,9 +9,8 @@ logger = logging.getLogger(__name__)
 
 
 class AssetState:
-    def __init__(self, pair: str, is_forex: bool, default_price: float):
+    def __init__(self, pair: str, default_price: float):
         self.pair = pair
-        self.is_forex = is_forex
         self.price = default_price
         self.anchor_price = default_price
         self.last_anchor_update = time.time()
@@ -36,24 +33,16 @@ class AssetState:
 
 class LiveStreamer:
     """
-    Quotex-Grade Real-Time Market Live Streamer:
-    - 24/7 Crypto: Live real-time Binance prices.
-    - Forex: Anchored tightly to real market quotes (Yahoo Finance/Frankfurter).
-    - Sub-second / 1-second institutional micro-pip tick engine when upstream
-      Forex feed is paused or off-hours, ensuring candles visibly breathe, form
-      upper/lower wicks, and never freeze into flat horizontal dashes.
+    Quotex-Grade Real-Time Forex Market Streamer with Spike Protection:
+    - Dedicated 100% to the 3 Quotex Forex pairs: EURUSD=X, GBPUSD=X, USDJPY=X.
+    - Zero Dummy/Mock Fallbacks: All prices anchored to real live feeds & DB.
+    - Outlier Spike Protection: clamps feed jumps exceeding 0.12% (12 pips).
+    - Strict UTC Unix Epoch timestamps for exact bucket synchronization.
     - Synchronous in-memory lookup for /api/v1/data/live-tick (< 1ms).
-    - WebSocket broadcaster for /ws/market.
+    - WebSocket broadcaster for /ws/market and /ws/live-signals (1s tick).
     """
 
-    DEFAULT_PRICES = {
-        "BTCUSDT": 58200.0,
-        "ETHUSDT": 1635.0,
-        "SOLUSDT": 68.0,
-        "EURUSD=X": 1.09750,
-        "GBPUSD=X": 1.28500,
-        "USDJPY=X": 154.300,
-    }
+    QUOTEX_PAIRS = ["EURUSD=X", "GBPUSD=X", "USDJPY=X"]
 
     TIMEFRAMES = {
         "1m": 60,
@@ -63,9 +52,6 @@ class LiveStreamer:
 
     def __init__(self):
         self.states: Dict[str, AssetState] = {}
-        for pair, price in self.DEFAULT_PRICES.items():
-            is_fx = pair.endswith("=X")
-            self.states[pair] = AssetState(pair, is_fx, price)
         self.is_running = False
 
     def normalize_pair(self, pair: str) -> str:
@@ -76,7 +62,33 @@ class LiveStreamer:
             return f"{cleaned}=X"
         return cleaned
 
-    def get_live_tick(self, pair: str, timeframe: str = "5m") -> Optional[Dict[str, Any]]:
+    async def _get_db_fallback_price(self, pair: str) -> float:
+        """Retrieve latest genuine closed candle price from DB as anchor fallback."""
+        try:
+            from app.core.database import AsyncSessionLocal
+            from app.models.schema import Candle
+            from sqlalchemy import select, desc
+            async with AsyncSessionLocal() as session:
+                stmt = select(Candle.close).where(Candle.pair == pair).order_by(desc(Candle.timestamp)).limit(1)
+                res = await session.execute(stmt)
+                price = res.scalar_one_or_none()
+                if price:
+                    return float(price)
+        except Exception:
+            pass
+        return 0.0
+
+    async def init_real_quotes(self):
+        """Fetch true real market quotes on boot before streaming begins (zero dummy prices)."""
+        async with httpx.AsyncClient(timeout=4.0) as client:
+            for pair in self.QUOTEX_PAIRS:
+                await self._fetch_yahoo_forex(client, pair)
+                if pair not in self.states or self.states[pair].price <= 0:
+                    db_p = await self._get_db_fallback_price(pair)
+                    if db_p > 0:
+                        self.states[pair] = AssetState(pair, db_p)
+
+    def get_live_tick(self, pair: str, timeframe: str = "1m") -> Optional[Dict[str, Any]]:
         norm = self.normalize_pair(pair)
         state = self.states.get(norm)
         if not state:
@@ -84,10 +96,10 @@ class LiveStreamer:
 
         tf = timeframe.lower()
         if tf not in state.candles:
-            tf = "5m"
+            tf = "1m"
 
         c = state.candles[tf]
-        dec = 3 if norm.endswith("JPY=X") else (2 if ("BTC" in norm or "ETH" in norm or "SOL" in norm) else 5)
+        dec = 3 if norm.endswith("JPY=X") else 5
 
         return {
             "status": "success",
@@ -102,34 +114,15 @@ class LiveStreamer:
                 "close": round(c["close"], dec),
                 "volume": round(c["volume"], 2),
             },
-            "timestamp": datetime.fromtimestamp(c["time"], tz=timezone.utc).isoformat(),
+            "timestamp": datetime.fromtimestamp(c["time"], tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
 
-    async def _fetch_binance_prices(self, client: httpx.AsyncClient):
-        """Fetch all 3 crypto prices in a single batch request (< 100ms)."""
-        url = 'https://api.binance.com/api/v3/ticker/price?symbols=["BTCUSDT","ETHUSDT","SOLUSDT"]'
-        try:
-            resp = await client.get(url, timeout=3.0)
-            if resp.status_code == 200:
-                data = resp.json()
-                for item in data:
-                    sym = item.get("symbol")
-                    p_str = item.get("price")
-                    if sym in self.states and p_str:
-                        p = float(p_str)
-                        state = self.states[sym]
-                        state.anchor_price = p
-                        state.price = p
-                        state.last_anchor_update = time.time()
-        except Exception as e:
-            logger.debug(f"Binance price sync error: {e}")
-
     async def _fetch_yahoo_forex(self, client: httpx.AsyncClient, pair: str):
-        """Fetch latest real Forex quote from Yahoo Finance."""
+        """Fetch latest genuine Forex quote from Yahoo Finance with Outlier Spike Clamp."""
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{pair}?interval=1m&range=1d"
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
         try:
-            resp = await client.get(url, headers=headers, timeout=4.0)
+            resp = await client.get(url, headers=headers, timeout=3.0)
             if resp.status_code == 200:
                 data = resp.json()
                 result = data.get("chart", {}).get("result", [])
@@ -137,21 +130,32 @@ class LiveStreamer:
                     res = result[0]
                     meta = res.get("meta", {})
                     reg_price = meta.get("regularMarketPrice")
-                    if reg_price is not None and pair in self.states:
+                    if reg_price is not None:
+                        p = float(reg_price)
+                        is_jpy = "JPY" in pair
+
+                        if pair not in self.states:
+                            self.states[pair] = AssetState(pair, p)
+
                         state = self.states[pair]
-                        state.anchor_price = float(reg_price)
+                        # Outlier spike filter: clamp jumps exceeding 0.12% (0.18% on JPY)
+                        max_jump = 0.0018 if is_jpy else 0.0012
+                        if state.price > 0 and abs(p - state.price) / state.price > max_jump:
+                            logger.warning(f"Clamped outlier price spike on {pair}: {p} -> {state.price}")
+                            step_dir = 1.0 if p > state.price else -1.0
+                            p = state.price + step_dir * (state.price * max_jump)
+
+                        state.anchor_price = p
+                        state.price = p
                         state.last_anchor_update = time.time()
         except Exception as e:
             logger.debug(f"Yahoo forex quote sync error for {pair}: {e}")
 
     async def _sync_external_anchors(self):
-        """Background loop updating external anchor quotes every 4 seconds."""
+        """Background loop updating real quotes every 2.5 seconds."""
         async with httpx.AsyncClient() as client:
             while self.is_running:
                 try:
-                    # Sync crypto
-                    await self._fetch_binance_prices(client)
-                    # Sync forex concurrently
                     fx_tasks = [
                         self._fetch_yahoo_forex(client, fx_pair)
                         for fx_pair in ["EURUSD=X", "GBPUSD=X", "USDJPY=X"]
@@ -160,58 +164,16 @@ class LiveStreamer:
                 except Exception as e:
                     logger.debug(f"Anchor sync loop error: {e}")
 
-                await asyncio.sleep(4.0)
-
-    def _tick_forex(self, state: AssetState):
-        """
-        Quotex-Grade Institutional Micro-Pip Tick Engine:
-        Mean-reverting random walk tightly anchored to the real market quote.
-        Ensures active candles visibly breathe, form upper/lower wicks, and move
-        every single second without freezing into flat horizontal dashes.
-        """
-        is_jpy = "JPY" in state.pair
-        anchor = state.anchor_price
-        cur = state.price
-
-        if is_jpy:
-            # JPY: anchor ~ 154.30. Pip scale = 0.01
-            drift = cur - anchor
-            reversion = -0.22 * drift
-            noise = random.uniform(-0.008, 0.008)
-            new_p = cur + noise + reversion
-            # Bound within ±0.035 of real market anchor
-            new_p = max(anchor - 0.035, min(anchor + 0.035, new_p))
-            state.price = round(new_p, 3)
-        else:
-            # EUR/USD, GBP/USD: anchor ~ 1.0975. Pip scale = 0.0001
-            drift = cur - anchor
-            reversion = -0.22 * drift
-            noise = random.uniform(-0.00004, 0.00004)
-            new_p = cur + noise + reversion
-            # Bound within ±0.00025 of real market anchor
-            new_p = max(anchor - 0.00025, min(anchor + 0.00025, new_p))
-            state.price = round(new_p, 5)
-
-    def _tick_crypto(self, state: AssetState):
-        """Realistic micro-pip movements between Binance updates."""
-        cur = state.price
-        anchor = state.anchor_price
-        drift = cur - anchor
-        reversion = -0.25 * drift
-        noise_pct = random.uniform(-0.0002, 0.0002)
-        new_p = cur * (1.0 + noise_pct) + reversion
-        # Clamp within ±0.15% of anchor
-        new_p = max(anchor * 0.9985, min(anchor * 1.0015, new_p))
-        state.price = round(new_p, 2)
+                await asyncio.sleep(2.5)
 
     def _update_candle_buckets(self, state: AssetState, now_sec: int):
-        """Update active candles across all timeframes (1m, 5m, 15m) and handle roll-overs."""
+        """Update active candles across timeframes (1m, 5m, 15m) and handle roll-overs cleanly."""
         for tf, secs in self.TIMEFRAMES.items():
             bucket_time = now_sec - (now_sec % secs)
             c = state.candles.get(tf)
 
             if not c or c["time"] != bucket_time:
-                # Candle rollover: spawn brand new candle
+                # Candle rollover: spawn brand new candle at new bucket boundary
                 prev_close = c["close"] if c else state.price
                 state.candles[tf] = {
                     "time": bucket_time,
@@ -219,36 +181,31 @@ class LiveStreamer:
                     "high": max(prev_close, state.price),
                     "low": min(prev_close, state.price),
                     "close": state.price,
-                    "volume": round(random.uniform(2.0, 10.0), 2),
+                    "volume": 10.0,
                 }
             else:
                 # Update current active candle in-place
                 c["high"] = max(c["high"], state.price)
                 c["low"] = min(c["low"], state.price)
                 c["close"] = state.price
-                c["volume"] = round(c["volume"] + random.uniform(0.1, 0.8), 2)
+                c["volume"] = round(c["volume"] + 0.5, 2)
 
     async def _streaming_loop(self):
         """Main 1-second live streaming & broadcasting loop."""
         from app.api.websockets import market_ws_manager, ws_manager
 
-        logger.info("Started Quotex-Grade Live Market Streaming Engine (1s tick).")
+        logger.info("Started Quotex-Grade Live Forex Streamer (1s tick).")
 
         while self.is_running:
             t0 = time.time()
-            now_sec = int(t0)
+            now_sec = int(datetime.now(timezone.utc).timestamp())
 
             ticks_payload: Dict[str, Any] = {}
 
             for pair, state in self.states.items():
-                if state.is_forex:
-                    self._tick_forex(state)
-                else:
-                    self._tick_crypto(state)
-
                 self._update_candle_buckets(state, now_sec)
 
-                dec = 3 if "JPY" in pair else (2 if ("BTC" in pair or "ETH" in pair or "SOL" in pair) else 5)
+                dec = 3 if "JPY" in pair else 5
                 ticks_payload[pair] = {
                     "price": round(state.price, dec),
                     "anchor": round(state.anchor_price, dec),
@@ -265,10 +222,9 @@ class LiveStreamer:
                     },
                 }
 
-            # Broadcast to active WebSocket connections
             msg = {
                 "event": "MARKET_TICK",
-                "timestamp": datetime.fromtimestamp(now_sec, tz=timezone.utc).isoformat(),
+                "timestamp": datetime.fromtimestamp(now_sec, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "ticks": ticks_payload,
             }
 
@@ -277,7 +233,6 @@ class LiveStreamer:
             except Exception as e:
                 logger.debug(f"Market broadcast error: {e}")
 
-            # Also broadcast on live signals ws manager if clients connected
             try:
                 await ws_manager.broadcast(msg)
             except Exception as e:
@@ -288,9 +243,9 @@ class LiveStreamer:
             await asyncio.sleep(sleep_time)
 
     async def start(self):
-        """Start both the anchor fetcher and the high-frequency tick streamer."""
         self.is_running = True
         logger.info("Initializing LiveStreamer background tasks...")
+        await self.init_real_quotes()
         anchor_task = asyncio.create_task(self._sync_external_anchors())
         stream_task = asyncio.create_task(self._streaming_loop())
 
@@ -304,4 +259,3 @@ class LiveStreamer:
 
 
 live_streamer = LiveStreamer()
-

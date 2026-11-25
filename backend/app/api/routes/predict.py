@@ -245,17 +245,18 @@ async def train_model_endpoint(
 
 @router.get("/signal", response_model=SignalResponse)
 async def get_trading_signal(
-    pair: str = Query(default="EURUSD=X", description="Asset pair e.g. EURUSD=X or BTCUSDT"),
-    timeframe: str = Query(default="5m", description="Candle timeframe e.g. 5m"),
+    pair: str = Query(default="EURUSD=X", description="Asset pair e.g. EURUSD=X"),
+    timeframe: str = Query(default="1m", description="Candle timeframe e.g. 1m, 5m"),
     confidence_threshold: float = Query(
-        default=0.60, ge=0.5, le=0.98, description="Confidence threshold for UP/DOWN signal (default 0.60)"
+        default=0.85, ge=0.5, le=0.98, description="Confidence threshold for UP/DOWN signal (default 0.85 High Precision)"
     ),
     db: AsyncSession = Depends(get_db),
 ) -> Any:
     """
-    Fetch latest real candles, extract features, run calibrated Ensemble prediction
-    with deterministic multi-indicator confluence scoring, apply strict 3-bar
-    expiry window, and persist & broadcast the signal.
+    Quotex-calibrated instantaneous (< 1s) signal inference:
+    Fetch latest real candles, extract features, compute binary momentum confluence,
+    evaluate active UP (CALL) or DOWN (PUT) setup with exact next-candle entry timing,
+    and persist & broadcast the signal.
     """
     norm_pair = market_data_service.normalize_pair(pair)
 
@@ -329,12 +330,11 @@ async def get_trading_signal(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Inference failed: {str(e)}")
 
-    # 3-bar directional horizon expiry calculation
+    # Expiry calculation (1 candle horizon for 1m binary trading)
     now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
-    step_secs = TIMEFRAME_SECONDS.get(timeframe.lower(), 300)
-    expiry_utc = now_utc + timedelta(seconds=3 * step_secs)
+    step_secs = TIMEFRAME_SECONDS.get(timeframe.lower(), 60)
+    expiry_utc = now_utc + timedelta(seconds=step_secs)
 
-    # Persist actionable trade signals to database
     signal_id = str(uuid.uuid4())
     is_tradeable = pred["direction"] in ["UP", "DOWN"]
     signal_record = Signal(
@@ -349,10 +349,27 @@ async def get_trading_signal(
         exit_price=None,
         status="PENDING" if is_tradeable else "DRAW",
     )
+
+    # Attach dynamic binary confluence fields
+    signal_record.next_candle_entry_in_sec = pred.get("next_candle_entry_in_sec")
+    signal_record.entry_instruction = pred.get("entry_instruction")
+    signal_record.confluence_score = pred.get("confluence_score", 0.0)
+    signal_record.status_reason = pred.get("status_reason")
+    signal_record.gate_reason = pred.get("gate_reason")
+    signal_record.call_put = pred.get("call_put")
+
     if is_tradeable:
         db.add(signal_record)
         await db.commit()
         await db.refresh(signal_record)
+
+        # Re-attach dynamic attributes after refresh
+        signal_record.next_candle_entry_in_sec = pred.get("next_candle_entry_in_sec")
+        signal_record.entry_instruction = pred.get("entry_instruction")
+        signal_record.confluence_score = pred.get("confluence_score", 0.0)
+        signal_record.status_reason = pred.get("status_reason")
+        signal_record.gate_reason = pred.get("gate_reason")
+        signal_record.call_put = pred.get("call_put")
 
         await ws_manager.broadcast(
             {
@@ -362,12 +379,16 @@ async def get_trading_signal(
                     "pair": signal_record.pair,
                     "timeframe": signal_record.timeframe,
                     "direction": signal_record.direction,
+                    "call_put": pred.get("call_put"),
                     "confidence": signal_record.confidence,
                     "confluence_score": pred.get("confluence_score", 0.0),
                     "gate_reason": pred.get("gate_reason"),
                     "entry_price": signal_record.entry_price,
                     "exit_price": signal_record.exit_price,
                     "status": signal_record.status,
+                    "next_candle_entry_in_sec": pred.get("next_candle_entry_in_sec"),
+                    "entry_instruction": pred.get("entry_instruction"),
+                    "status_reason": pred.get("status_reason"),
                     "timestamp": (
                         signal_record.timestamp.isoformat()
                         if signal_record.timestamp
@@ -385,11 +406,8 @@ async def get_trading_signal(
     return signal_record
 
 
-PAIRS_TO_SCAN = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "EURUSD=X", "GBPUSD=X", "USDJPY=X"]
+PAIRS_TO_SCAN = ["EURUSD=X", "GBPUSD=X", "USDJPY=X"]
 PAIR_LABELS = {
-    "BTCUSDT": "BTC/USDT",
-    "ETHUSDT": "ETH/USDT",
-    "SOLUSDT": "SOL/USDT",
     "EURUSD=X": "EUR/USD",
     "GBPUSD=X": "GBP/USD",
     "USDJPY=X": "USD/JPY",
@@ -467,14 +485,14 @@ async def _scan_single_pair(pair: str, timeframe: str, threshold: float) -> Dict
 
 @router.get("/scan-all")
 async def scan_all_opportunities(
-    timeframe: str = Query(default="5m", description="Candle timeframe e.g. 5m"),
+    timeframe: str = Query(default="1m", description="Candle timeframe e.g. 1m, 5m"),
     threshold: float = Query(
-        default=0.60, ge=0.5, le=0.98, description="Confidence threshold (default 0.60)"
+        default=0.85, ge=0.5, le=0.98, description="Confidence threshold (default 0.85 High Precision)"
     ),
 ) -> Dict[str, Any]:
     """
-    Run fast concurrent inference across all 6 core pairs:
-    BTCUSDT, ETHUSDT, SOLUSDT, EURUSD=X, GBPUSD=X, USDJPY=X.
+    Run fast concurrent inference across the 3 Quotex Forex pairs:
+    EURUSD=X, GBPUSD=X, USDJPY=X.
     Returns ranked list sorted by actionable signal & confidence descending.
     """
     tasks = [_scan_single_pair(p, timeframe, threshold) for p in PAIRS_TO_SCAN]

@@ -1,4 +1,5 @@
 
+from datetime import datetime, timezone
 from typing import Any, Dict, List
 from fastapi import APIRouter, Depends, HTTPException, Query
 import pandas as pd
@@ -42,7 +43,20 @@ async def fetch_market_data(
         "newly_stored_count": new_saved,
         "candles": [
             {
-                "timestamp": c["timestamp"].isoformat(),
+                "timestamp": (
+                    c["timestamp"].strftime("%Y-%m-%dT%H:%M:%SZ")
+                    if hasattr(c["timestamp"], "strftime")
+                    else (str(c["timestamp"]) + ("Z" if not str(c["timestamp"]).endswith("Z") else ""))
+                ),
+                "time": (
+                    c.get("time")
+                    if c.get("time") is not None
+                    else (
+                        int(c["timestamp"].replace(tzinfo=timezone.utc).timestamp())
+                        if hasattr(c["timestamp"], "replace")
+                        else int(pd.to_datetime(c["timestamp"]).replace(tzinfo=timezone.utc).timestamp())
+                    )
+                ),
                 "open": c["open"],
                 "high": c["high"],
                 "low": c["low"],

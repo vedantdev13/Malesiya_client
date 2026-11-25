@@ -12,21 +12,18 @@ export default function Header({
   confidenceThreshold,
   onConfidenceChange,
 }) {
+  // Only the 3 Core Quotex Forex pairs
   const pairs = [
-    { label: 'BTC / USDT (24/7 Live)', value: 'BTCUSDT',  group: 'Crypto' },
-    { label: 'ETH / USDT (24/7 Live)', value: 'ETHUSDT',  group: 'Crypto' },
-    { label: 'SOL / USDT (24/7 Live)', value: 'SOLUSDT',  group: 'Crypto' },
-    { label: 'EUR / USD (Live FX)',    value: 'EURUSD=X', group: 'Forex' },
-    { label: 'GBP / USD (Live FX)',    value: 'GBPUSD=X', group: 'Forex' },
-    { label: 'USD / JPY (Live FX)',    value: 'USDJPY=X', group: 'Forex' },
+    { label: 'EUR / USD (Quotex FX)', value: 'EURUSD=X', group: 'Quotex Forex' },
+    { label: 'GBP / USD (Quotex FX)', value: 'GBPUSD=X', group: 'Quotex Forex' },
+    { label: 'USD / JPY (Quotex FX)', value: 'USDJPY=X', group: 'Quotex Forex' },
   ];
 
   const timeframes = ['1m', '5m', '15m'];
 
   const thresholdPct = Math.round(confidenceThreshold * 100);
-  const isHighPrecision = thresholdPct >= 75;
-  const isBalancedPro = thresholdPct >= 60 && thresholdPct < 75;
-  const isMedium = thresholdPct < 60;
+  const isHighPrecision = thresholdPct >= 80;
+  const isBalanced = thresholdPct < 80;
 
   return (
     <header className="bg-[#151D2A] border-b border-[#2A3447] px-4 py-3 sm:px-6">
@@ -42,8 +39,8 @@ export default function Header({
                 <span className="font-bold text-lg tracking-wider text-[#F3F4F6]">
                   QUANTUM <span className="text-[#10B981]">AI</span>
                 </span>
-                <span className="text-[10px] font-semibold uppercase tracking-widest px-1.5 py-0.5 rounded bg-[#2A3447] text-[#9CA3AF]">
-                  PRO
+                <span className="text-[10px] font-semibold uppercase tracking-widest px-1.5 py-0.5 rounded bg-[#10B981]/20 text-[#10B981] border border-[#10B981]/30">
+                  QUOTEX FX
                 </span>
               </div>
             </div>
@@ -57,7 +54,7 @@ export default function Header({
               <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-[#10B981] opacity-75"></span>
               <span className="relative inline-flex rounded-full h-2 w-2 bg-[#10B981]"></span>
             </span>
-            <span className="text-[11px] font-medium text-[#9CA3AF] tracking-wide">LIVE FEED</span>
+            <span className="text-[11px] font-medium text-[#9CA3AF] tracking-wide">LIVE FX FEED</span>
           </div>
 
           {/* Live Price */}
@@ -65,8 +62,7 @@ export default function Header({
             <div className="hidden md:flex items-center gap-2 font-mono">
               <span className="text-sm font-semibold text-white">
                 {lastPrice.toLocaleString(undefined, {
-                  minimumFractionDigits: selectedPair.includes('JPY') ? 3 :
-                    selectedPair.includes('BTC') ? 2 : 5,
+                  minimumFractionDigits: selectedPair.includes('JPY') ? 3 : 5,
                 })}
               </span>
               {priceChange !== undefined && (
@@ -85,7 +81,7 @@ export default function Header({
             <select
               value={selectedPair}
               onChange={(e) => onSelectPair(e.target.value)}
-              className="appearance-none bg-[#0B0E14] border border-[#2A3447] text-[#F3F4F6] text-xs font-semibold rounded-lg pl-3 pr-8 py-1.5 cursor-pointer hover:border-[#3B4861] focus:outline-none focus:border-[#10B981] transition-colors"
+              className="appearance-none bg-[#0B0E14] border border-[#10B981]/40 text-[#F3F4F6] text-xs font-semibold rounded-lg pl-3 pr-8 py-1.5 cursor-pointer hover:border-[#10B981] focus:outline-none focus:border-[#10B981] transition-colors"
             >
               {pairs.map((p) => (
                 <option key={p.value} value={p.value} className="bg-[#151D2A]">
@@ -104,11 +100,10 @@ export default function Header({
                 <button
                   key={tf}
                   onClick={() => onSelectTimeframe(tf)}
-                  className={`px-3 py-1 text-xs font-medium rounded-md transition-all ${
-                    active
-                      ? 'bg-[#10B981] text-[#0B0E14] font-semibold shadow-sm'
-                      : 'text-[#9CA3AF] hover:text-[#F3F4F6] hover:bg-[#151D2A]'
-                  }`}
+                  className={`px-3 py-1 text-xs font-medium rounded-md transition-all ${active
+                    ? 'bg-[#10B981] text-[#0B0E14] font-semibold shadow-sm'
+                    : 'text-[#9CA3AF] hover:text-[#F3F4F6] hover:bg-[#151D2A]'
+                    }`}
                 >
                   {tf}
                 </button>
@@ -124,28 +119,26 @@ export default function Header({
                 <span className="text-[11px] text-[#9CA3AF]">Confidence:</span>
                 <span
                   className={`text-[11px] font-bold font-mono ${
-                    isHighPrecision ? 'text-[#F59E0B]' :
-                    isBalancedPro ? 'text-[#10B981]' :
-                    'text-[#9CA3AF]'
+                    isHighPrecision ? 'text-[#10B981]' : 'text-[#F59E0B]'
                   }`}
                 >
                   {thresholdPct}%
                 </span>
                 {isHighPrecision && (
-                  <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-[#F59E0B]/20 text-[#F59E0B] border border-[#F59E0B]/30 font-semibold uppercase tracking-wide">
-                    High Precision
+                  <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-[#10B981]/20 text-[#10B981] border border-[#10B981]/30 font-semibold uppercase tracking-wide">
+                    85% High Precision
                   </span>
                 )}
-                {isBalancedPro && (
-                  <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-[#10B981]/20 text-[#10B981] border border-[#10B981]/30 font-semibold uppercase tracking-wide">
-                    Balanced Pro
+                {isBalanced && (
+                  <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-[#F59E0B]/20 text-[#F59E0B] border border-[#F59E0B]/30 font-semibold uppercase tracking-wide">
+                    Custom ({thresholdPct}%)
                   </span>
                 )}
               </div>
               <input
                 type="range"
-                min="55"
-                max="90"
+                min="50"
+                max="95"
                 step="1"
                 value={thresholdPct}
                 onChange={(e) => onConfidenceChange(Number(e.target.value) / 100)}
@@ -157,16 +150,15 @@ export default function Header({
 
           {/* Backend Status Badge */}
           <div
-            className={`flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium border ${
-              isBackendConnected
-                ? 'bg-[#10B981]/10 text-[#10B981] border-[#10B981]/30'
-                : 'bg-[#EF4444]/10 text-[#EF4444] border-[#EF4444]/30'
-            }`}
+            className={`flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium border ${isBackendConnected
+              ? 'bg-[#10B981]/10 text-[#10B981] border-[#10B981]/30'
+              : 'bg-[#EF4444]/10 text-[#EF4444] border-[#EF4444]/30'
+              }`}
           >
             {isBackendConnected ? (
-              <><Wifi className="w-3.5 h-3.5" /><span>Backend Connected</span></>
+              <><Wifi className="w-3.5 h-3.5" /><span>Quotex Engine Active</span></>
             ) : (
-              <><WifiOff className="w-3.5 h-3.5" /><span>Disconnected</span></>
+              <><WifiOff className="w-3.5 h-3.5" /><span>Connecting...</span></>
             )}
           </div>
         </div>

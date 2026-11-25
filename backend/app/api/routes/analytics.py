@@ -1,12 +1,26 @@
 from typing import Any, Dict, Optional
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
 from app.models.schema import Signal
 from app.services.market_data import market_data_service
 
 router = APIRouter(prefix="/analytics", tags=["Analytics & Performance"])
+
+
+@router.post("/reset")
+async def reset_analytics_history(db: AsyncSession = Depends(get_db)) -> Dict[str, Any]:
+    """
+    Clear historical signal outcomes and test rows from the signals table,
+    resetting performance metrics to a fresh zero-baseline state.
+    """
+    await db.execute(delete(Signal))
+    await db.commit()
+    return {
+        "status": "success",
+        "message": "All historical trading signals and performance test stats reset successfully.",
+    }
 
 
 @router.get("/performance")

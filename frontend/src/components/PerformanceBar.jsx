@@ -1,10 +1,11 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { fetchPerformance } from '../services/api';
-import { TrendingUp, TrendingDown, Target, Activity, Radio } from 'lucide-react';
+import { fetchPerformance, resetPerformance } from '../services/api';
+import { TrendingUp, TrendingDown, Target, Activity, Radio, RotateCcw } from 'lucide-react';
 
-export default function PerformanceBar({ pair, timeframe, refreshTrigger }) {
+export default function PerformanceBar({ pair, timeframe, refreshTrigger, onReset }) {
   const [stats, setStats] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [isResetting, setIsResetting] = useState(false);
 
   const loadStats = useCallback(async () => {
     try {
@@ -16,6 +17,22 @@ export default function PerformanceBar({ pair, timeframe, refreshTrigger }) {
       setLoading(false);
     }
   }, [pair, timeframe]);
+
+  const handleReset = async () => {
+    if (!window.confirm('Reset historical test signals and performance metrics to zero baseline?')) {
+      return;
+    }
+    setIsResetting(true);
+    try {
+      await resetPerformance();
+      await loadStats();
+      if (onReset) onReset();
+    } catch (err) {
+      console.error('Failed to reset performance stats:', err);
+    } finally {
+      setIsResetting(false);
+    }
+  };
 
   // Reload on external trigger (new signal resolved via WebSocket)
   useEffect(() => {
@@ -123,6 +140,17 @@ export default function PerformanceBar({ pair, timeframe, refreshTrigger }) {
             />
           </div>
         </div>
+
+        {/* Reset Stats Button */}
+        <button
+          onClick={handleReset}
+          disabled={isResetting}
+          title="Reset historical test stats to fresh zero-baseline"
+          className="ml-auto flex items-center gap-1 px-2 py-1 text-[11px] font-mono rounded bg-[#0B0E14] hover:bg-[#EF4444]/15 border border-[#2A3447] hover:border-[#EF4444]/40 text-[#9CA3AF] hover:text-[#EF4444] transition-all disabled:opacity-50"
+        >
+          <RotateCcw className={`w-3 h-3 ${isResetting ? 'animate-spin' : ''}`} />
+          <span>Reset Stats</span>
+        </button>
       </div>
     </div>
   );

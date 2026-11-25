@@ -2,19 +2,15 @@ import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { createChart } from 'lightweight-charts';
 import { fetchCandles } from '../services/api';
 import { useWebSocket } from '../hooks/useWebSocket';
-import { RefreshCw } from 'lucide-react';
+import { RefreshCw, Clock, Zap } from 'lucide-react';
 
-// ─── Candle bucket duration per timeframe ──────────────────────────────────
 const TF_SECONDS = { '1m': 60, '5m': 300, '15m': 900 };
 
-/** Decimal precision per asset */
 function getPrecision(pair) {
   if (pair.includes('JPY')) return 3;
-  if (pair.includes('BTC') || pair.includes('ETH') || pair.includes('SOL')) return 2;
   return 5;
 }
 
-/** Resolve the market WebSocket URL dynamically (Vite proxy in dev, explicit host in prod) */
 function resolveMarketWsUrl() {
   const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
   if (import.meta.env.DEV) {
@@ -32,6 +28,7 @@ export default function TradingChart({ pair, timeframe, onPriceUpdate }) {
   const chartContainerRef = useRef(null);
   const chartInstanceRef  = useRef(null);
   const seriesRef         = useRef(null);
+  const priceLineRef      = useRef(null);
   const firstCandleOpenRef = useRef(null);
 
   const [loading, setLoading]         = useState(true);
@@ -42,8 +39,19 @@ export default function TradingChart({ pair, timeframe, onPriceUpdate }) {
 
   const pairRef      = useRef(pair);
   const timeframeRef = useRef(timeframe);
-  useEffect(() => { pairRef.current = pair;      }, [pair]);
+  useEffect(() => { pairRef.current = pair; }, [pair]);
   useEffect(() => { timeframeRef.current = timeframe; }, [timeframe]);
+
+  const tfSecs = TF_SECONDS[timeframe] || 60;
+  const candleProgressPct = countdown != null ? Math.min(100, Math.max(0, ((tfSecs - countdown) / tfSecs) * 100)) : 0;
+  const isEntryZone = countdown != null && countdown <= 5;
+
+  const fmtCountdown = (secs) => {
+    if (secs == null) return '--:--';
+    const m = Math.floor(secs / 60);
+    const s = secs % 60;
+    return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+  };
 
   // ─── Load historical candles ─────────────────────────────────────────────
   const loadData = useCallback(async () => {
@@ -55,14 +63,22 @@ export default function TradingChart({ pair, timeframe, onPriceUpdate }) {
 
       if (data?.candles?.length > 0) {
         const parsed = data.candles
-          .map((c) => ({
-            time: Math.floor(new Date(c.timestamp).getTime() / 1000),
-            open:   Number(c.open),
-            high:   Number(c.high),
-            low:    Number(c.low),
-            close:  Number(c.close),
-            volume: Number(c.volume || 0),
-          }))
+          .map((c) => {
+            let t = c.time;
+            if (t == null) {
+              const tsStr = String(c.timestamp || '');
+              const utcStr = tsStr.endsWith('Z') || tsStr.includes('+') ? tsStr : `${tsStr}Z`;
+              t = Math.floor(new Date(utcStr).getTime() / 1000);
+            }
+            return {
+              time: Number(t),
+              open:   Number(c.open),
+              high:   Number(c.high),
+              low:    Number(c.low),
+              close:  Number(c.close),
+              volume: Number(c.volume || 0),
+            };
+          })
           .sort((a, b) => a.time - b.time);
 
         // Deduplicate
@@ -102,7 +118,7 @@ export default function TradingChart({ pair, timeframe, onPriceUpdate }) {
     }
   }, [pair, timeframe, onPriceUpdate]);
 
-  // ─── Apply a live tick to the candlestick series ─────────────────────────
+  // ─── Apply a live tick to the candlestick series & update floating price line ───
   const applyTick = useCallback((candleData) => {
     if (!seriesRef.current) return;
     try {
@@ -113,15 +129,32 @@ export default function TradingChart({ pair, timeframe, onPriceUpdate }) {
         low:    prev.low ? Math.min(prev.low, candleData.low) : candleData.low,
         volume: prev.volume,
       }));
+
+      // Update Quotex-style floating price line with countdown title
+      const isCandleUp = candleData.close >= candleData.open;
+      const lineColor = isCandleUp ? '#10B981' : '#EF4444';
+
+      if (priceLineRef.current) {
+        seriesRef.current.removePriceLine(priceLineRef.current);
+      }
+      priceLineRef.current = seriesRef.current.createPriceLine({
+        price: candleData.close,
+        color: lineColor,
+        lineWidth: 1,
+        lineStyle: 2, // Dashed line across chart
+        axisLabelVisible: true,
+        title: `⏱ ${fmtCountdown(countdown)}`,
+      });
+
       if (onPriceUpdate) {
         const firstOpen = firstCandleOpenRef.current;
         const chg = firstOpen ? ((candleData.close - firstOpen) / firstOpen) * 100 : 0;
         onPriceUpdate(candleData.close, chg);
       }
     } catch (e) {
-      // series not ready yet — silently skip
+      // series not ready yet
     }
-  }, [onPriceUpdate]);
+  }, [countdown, onPriceUpdate]);
 
   // ─── WebSocket market tick handler ───────────────────────────────────────
   const handleMarketTick = useCallback((msg) => {
@@ -146,10 +179,10 @@ export default function TradingChart({ pair, timeframe, onPriceUpdate }) {
     applyTick(candle);
 
     // Live candle countdown
-    const tfSecs = TF_SECONDS[curTf] || 300;
+    const secs = TF_SECONDS[curTf] || 60;
     const nowSec = Math.floor(Date.now() / 1000);
-    const bucketStart = nowSec - (nowSec % tfSecs);
-    const remaining = tfSecs - (nowSec - bucketStart);
+    const bucketStart = nowSec - (nowSec % secs);
+    const remaining = secs - (nowSec - bucketStart);
     setCountdown(remaining);
   }, [applyTick]);
 
@@ -158,27 +191,38 @@ export default function TradingChart({ pair, timeframe, onPriceUpdate }) {
     pingIntervalMs: 20000,
   });
 
-  // ─── Countdown label formatter ────────────────────────────────────────────
-  // Also tick the countdown every second from local clock
+  // ─── Clock timer to update countdown every second ────────────────────────
   useEffect(() => {
     const curTf = timeframe;
-    const tfSecs = TF_SECONDS[curTf] || 300;
+    const secs = TF_SECONDS[curTf] || 60;
     const tick = () => {
       const nowSec = Math.floor(Date.now() / 1000);
-      const bucketStart = nowSec - (nowSec % tfSecs);
-      setCountdown(tfSecs - (nowSec - bucketStart));
+      const bucketStart = nowSec - (nowSec % secs);
+      const rem = secs - (nowSec - bucketStart);
+      setCountdown(rem);
+
+      // Also refresh price line title with latest countdown
+      if (seriesRef.current && currentCandle && priceLineRef.current) {
+        try {
+          seriesRef.current.removePriceLine(priceLineRef.current);
+          const isCandleUp = currentCandle.close >= currentCandle.open;
+          priceLineRef.current = seriesRef.current.createPriceLine({
+            price: currentCandle.close,
+            color: isCandleUp ? '#10B981' : '#EF4444',
+            lineWidth: 1,
+            lineStyle: 2,
+            axisLabelVisible: true,
+            title: `⏱ ${fmtCountdown(rem)}`,
+          });
+        } catch {
+          // ignore
+        }
+      }
     };
     tick();
     const id = setInterval(tick, 1000);
     return () => clearInterval(id);
-  }, [timeframe]);
-
-  const fmtCountdown = (secs) => {
-    if (secs == null) return '--:--';
-    const m = Math.floor(secs / 60);
-    const s = secs % 60;
-    return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
-  };
+  }, [timeframe, currentCandle]);
 
   // ─── Init Lightweight Charts ──────────────────────────────────────────────
   useEffect(() => {
@@ -278,6 +322,7 @@ export default function TradingChart({ pair, timeframe, onPriceUpdate }) {
         chartInstanceRef.current.remove();
         chartInstanceRef.current = null;
         seriesRef.current = null;
+        priceLineRef.current = null;
       }
     };
   }, [pair, timeframe]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -291,13 +336,15 @@ export default function TradingChart({ pair, timeframe, onPriceUpdate }) {
       <div className="flex flex-wrap items-center justify-between px-4 py-2.5 bg-[#111722] border-b border-[#2A3447] text-xs font-mono">
         <div className="flex items-center gap-4">
           <div className="flex items-center gap-1.5 font-bold text-sm text-[#F3F4F6]">
-            <span>{pair}</span>
-            <span className="text-[#9CA3AF] text-xs font-normal">[{timeframe}]</span>
+            <span>{pair.replace('=X', '')}</span>
+            <span className="text-[#10B981] text-xs font-semibold px-1.5 py-0.5 rounded bg-[#10B981]/15">
+              [{timeframe} FX]
+            </span>
           </div>
 
-          {/* LIVE badge + countdown timer */}
+          {/* Quotex-style LIVE badge + countdown timer */}
           <div className="hidden sm:flex items-center gap-2">
-            <div className="flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-[#0B0E14] border border-[#10B981]/30">
+            <div className="flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-[#0B0E14] border border-[#10B981]/40">
               <span className="relative flex h-2 w-2">
                 <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-[#10B981] opacity-75" />
                 <span className="relative inline-flex rounded-full h-2 w-2 bg-[#10B981]" />
@@ -305,17 +352,20 @@ export default function TradingChart({ pair, timeframe, onPriceUpdate }) {
               <span className="text-[10px] font-semibold text-[#10B981] tracking-wider">LIVE 1S</span>
             </div>
 
-            {/* Candle countdown — just like Quotex */}
-            <div className="flex items-center gap-1 px-2 py-0.5 rounded-full bg-[#0B0E14] border border-[#F59E0B]/30">
-              <span className="text-[10px] text-[#F59E0B] font-mono font-semibold">
-                ⏱ {fmtCountdown(countdown)}
+            {/* Candle countdown timer badge */}
+            <div className={`flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-[#0B0E14] border transition-all ${
+              isEntryZone ? 'border-[#10B981] bg-[#10B981]/20 animate-pulse' : 'border-[#F59E0B]/40'
+            }`}>
+              <Clock className={`w-3 h-3 ${isEntryZone ? 'text-[#10B981]' : 'text-[#F59E0B]'}`} />
+              <span className={`text-[11px] font-mono font-bold ${isEntryZone ? 'text-[#10B981]' : 'text-[#F59E0B]'}`}>
+                {fmtCountdown(countdown)}
               </span>
             </div>
 
-            {/* WebSocket status dot */}
+            {/* WebSocket status indicator */}
             <div
-              className={`w-1.5 h-1.5 rounded-full ${wsStatus === 'open' ? 'bg-[#10B981]' : 'bg-[#EF4444] animate-pulse'}`}
-              title={`WS: ${wsStatus}`}
+              className={`w-2 h-2 rounded-full ${wsStatus === 'open' ? 'bg-[#10B981]' : 'bg-[#EF4444] animate-pulse'}`}
+              title={`Market Stream: ${wsStatus}`}
             />
           </div>
 
@@ -350,18 +400,46 @@ export default function TradingChart({ pair, timeframe, onPriceUpdate }) {
         </div>
       </div>
 
-      {/* Chart Canvas */}
+      {/* Chart Canvas & Quotex Floating Countdown Overlay */}
       <div className="relative flex-1 min-h-[460px] w-full bg-[#151D2A]">
+        {/* Quotex-Style Floating Candle Countdown HUD (Top Right) */}
+        <div className="absolute right-16 top-3 z-10 flex items-center gap-2 bg-[#0B0E14]/85 backdrop-blur-md border border-[#2A3447] px-3 py-1.5 rounded-lg shadow-2xl font-mono pointer-events-none">
+          <div className="flex items-center gap-1.5">
+            <span className={`relative flex h-2 w-2 ${isEntryZone ? 'animate-ping' : ''}`}>
+              <span className={`inline-flex rounded-full h-2 w-2 ${isEntryZone ? 'bg-[#10B981]' : 'bg-[#F59E0B]'}`}></span>
+            </span>
+            <div className="flex flex-col">
+              <span className="text-[9px] text-[#9CA3AF] uppercase font-semibold leading-tight">
+                {isEntryZone ? 'ENTRY READY' : 'NEXT CANDLE'}
+              </span>
+              <span className={`text-xs font-bold leading-tight ${isEntryZone ? 'text-[#10B981]' : 'text-[#F59E0B]'}`}>
+                ⏱ {fmtCountdown(countdown)}
+              </span>
+            </div>
+          </div>
+
+          {/* Candle elapsed progress bar */}
+          <div className="w-10 h-1.5 bg-[#1F2937] rounded-full overflow-hidden ml-1">
+            <div
+              className={`h-full transition-all duration-1000 ${
+                isEntryZone ? 'bg-[#10B981]' : 'bg-gradient-to-r from-[#10B981] to-[#F59E0B]'
+              }`}
+              style={{ width: `${candleProgressPct}%` }}
+            />
+          </div>
+        </div>
+
         {loading && (
-          <div className="absolute inset-0 z-10 flex items-center justify-center bg-[#151D2A]/70 backdrop-blur-sm">
+          <div className="absolute inset-0 z-20 flex items-center justify-center bg-[#151D2A]/70 backdrop-blur-sm">
             <div className="flex flex-col items-center gap-2">
               <div className="w-7 h-7 border-2 border-[#10B981] border-t-transparent rounded-full animate-spin" />
-              <span className="text-xs text-[#9CA3AF] font-mono">Loading market stream...</span>
+              <span className="text-xs text-[#9CA3AF] font-mono">Loading Quotex real-time feed...</span>
             </div>
           </div>
         )}
+
         {error && (
-          <div className="absolute inset-0 z-10 flex items-center justify-center bg-[#151D2A]/90 p-4">
+          <div className="absolute inset-0 z-20 flex items-center justify-center bg-[#151D2A]/90 p-4">
             <div className="text-center max-w-sm">
               <p className="text-sm text-[#EF4444] font-medium mb-2">{error}</p>
               <button
@@ -373,6 +451,7 @@ export default function TradingChart({ pair, timeframe, onPriceUpdate }) {
             </div>
           </div>
         )}
+
         <div ref={chartContainerRef} className="w-full h-full" />
       </div>
     </div>

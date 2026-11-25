@@ -14,10 +14,18 @@ logger = logging.getLogger(__name__)
 
 class SignalResolver:
     async def get_latest_price(
-        self, db: AsyncSession, pair: str, timeframe: str = "5m"
+        self, db: AsyncSession, pair: str, timeframe: str = "1m"
     ) -> float:
-        """Fetch the most recent close price for a pair from feed or database."""
+        """Fetch the most recent close price for a pair from live streamer, feed or database."""
         norm_pair = market_data_service.normalize_pair(pair)
+        try:
+            from app.services.live_streamer import live_streamer
+            state = live_streamer.states.get(norm_pair)
+            if state and state.price > 0:
+                return float(state.price)
+        except Exception:
+            pass
+
         try:
             live_candles = await market_data_service.fetch_candles(
                 pair=norm_pair, timeframe=timeframe, limit=5
@@ -140,7 +148,7 @@ async def start_resolver_loop():
             except Exception as e:
                 logger.error(f"Error in resolver background loop: {e}", exc_info=True)
 
-            await asyncio.sleep(10)
+            await asyncio.sleep(2)
     except asyncio.CancelledError:
         logger.info("Signal outcome resolver background loop stopped cleanly.")
 

@@ -12,8 +12,6 @@ Isko dabane par backend Binance / Yahoo Finance se pichhli 1,000 live candles ut
 Ye Live Prediction Button hai (jab bhi client trade lena chahe, isko dabata hai).
 
 Ye abhi ki latest live candle ko check karta hai, aur 1 second ke andar "LATEST SIGNAL" box mein result nikal kar deta hai.
-
-
 ''' 
 
 import asyncio
