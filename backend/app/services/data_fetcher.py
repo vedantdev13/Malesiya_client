@@ -383,7 +383,51 @@ class DataFetcher:
             except Exception as e:
                 logger.warning(f"Yahoo live tick failed for {norm_pair}: {e}")
 
-            # Fallback to DB latest candle
+            # Fallback 1: open.er-api.com real-time FX spot rate
+            try:
+                async with httpx.AsyncClient(timeout=3.0) as client:
+                    resp = await client.get("https://open.er-api.com/v6/latest/USD")
+                    if resp.status_code == 200:
+                        rates = resp.json().get("rates", {})
+                        spot_p = None
+                        if norm_pair == "EURUSD=X" and "EUR" in rates and float(rates["EUR"]) > 0:
+                            spot_p = 1.0 / float(rates["EUR"])
+                        elif norm_pair == "GBPUSD=X" and "GBP" in rates and float(rates["GBP"]) > 0:
+                            spot_p = 1.0 / float(rates["GBP"])
+                        elif norm_pair == "USDJPY=X" and "JPY" in rates and float(rates["JPY"]) > 0:
+                            spot_p = float(rates["JPY"])
+
+                        if spot_p:
+                            is_jpy = "JPY" in norm_pair
+                            now_utc = datetime.now(timezone.utc)
+                            now_sec = int(now_utc.timestamp())
+                            interval = "1m" if timeframe.lower() == "1m" else ("5m" if timeframe.lower() == "5m" else "15m")
+                            tf_sec = 60 if interval == "1m" else (900 if interval == "15m" else 300)
+                            bucket_ts = now_sec - (now_sec % tf_sec)
+                            dec = 3 if is_jpy else 5
+                            cur_p = round(spot_p, dec)
+
+                            result_data = {
+                                "status": "success",
+                                "pair": norm_pair,
+                                "timeframe": timeframe,
+                                "price": cur_p,
+                                "candle": {
+                                    "time": bucket_ts,
+                                    "open": cur_p,
+                                    "high": cur_p,
+                                    "low": cur_p,
+                                    "close": cur_p,
+                                    "volume": 10.0,
+                                },
+                                "timestamp": datetime.fromtimestamp(bucket_ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                            }
+                            _TICK_CACHE[cache_key] = {"ts": now, "data": result_data}
+                            return result_data
+            except Exception as e:
+                logger.debug(f"open.er-api live-tick fallback error: {e}")
+
+            # Fallback 2: DB latest candle
             try:
                 async with AsyncSessionLocal() as session:
                     stmt = (

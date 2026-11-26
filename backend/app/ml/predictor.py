@@ -207,8 +207,8 @@ class SignalPredictor:
 
         # ─── Dead / Flat Market Filter ───────────────────────────────────────
         ema_spread = abs(ema_9 - ema_21) / (entry_price + 1e-8)
-        if (adx_val < 12.0 and ema_spread < 0.0001) or (candle_range < 1e-6 and abs(p_up - p_down) < 0.02):
-            status_msg = f"Dead Market / Low Volatility (ADX {adx_val:.1f} < 12) — Low Edge"
+        if adx_val < 16.0 or ema_spread < 0.0001 or (candle_range < 1e-6 and abs(p_up - p_down) < 0.02):
+            status_msg = f"Dead Market / Low Volatility (ADX {adx_val:.1f} < 16) — Low Edge"
             instruction = f"WAIT — Low Edge (Skip This Candle) (in {rem_sec}s)"
             # Cap confidence well below 72% so it strictly blocks under 85% high-precision gate
             capped_conf = min(0.68, round(max(p_up, p_down), 4))
@@ -284,10 +284,10 @@ class SignalPredictor:
             bonus = min(0.04, max(0.0, (ml_prob - 0.50) * 0.06 + confluence_score * 0.03))
             final_confidence = min(0.89, round(0.85 + bonus, 4))
         else:
-            # Conflicting indicators (<= 1/3 confirmations) or choppy/weak momentum -> Capped below 72%
+            # Conflicting indicators (<= 1/3 confirmations) or choppy/weak momentum -> Capped strictly below 70%
             tech_confirmed = False
             raw_eval = 0.50 * max(p_up, p_down) + 0.50 * confluence_score
-            final_confidence = min(0.71, round(raw_eval, 4))
+            final_confidence = min(0.70, round(raw_eval, 4))
 
         if not tech_confirmed:
             direction = "NO_SIGNAL"

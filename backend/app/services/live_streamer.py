@@ -1,6 +1,7 @@
 import asyncio
 from datetime import datetime, timezone
 import logging
+import random
 import time
 from typing import Any, Dict, Optional
 import httpx
@@ -83,6 +84,13 @@ class LiveStreamer:
         async with httpx.AsyncClient(timeout=4.0) as client:
             for pair in self.QUOTEX_PAIRS:
                 await self._fetch_yahoo_forex(client, pair)
+            
+            # If any pair is still missing or <= 0, query open.er-api.com fallback
+            missing = [p for p in self.QUOTEX_PAIRS if p not in self.states or self.states[p].price <= 0]
+            if missing:
+                await self._fetch_open_er_forex(client)
+
+            for pair in self.QUOTEX_PAIRS:
                 if pair not in self.states or self.states[pair].price <= 0:
                     db_p = await self._get_db_fallback_price(pair)
                     if db_p > 0:
@@ -151,8 +159,42 @@ class LiveStreamer:
         except Exception as e:
             logger.debug(f"Yahoo forex quote sync error for {pair}: {e}")
 
+    async def _fetch_open_er_forex(self, client: httpx.AsyncClient):
+        """Fallback to open.er-api.com for real-time FX spot quotes when Yahoo is slow or rate-limited."""
+        url = "https://open.er-api.com/v6/latest/USD"
+        try:
+            resp = await client.get(url, timeout=3.5)
+            if resp.status_code == 200:
+                data = resp.json()
+                rates = data.get("rates", {})
+                if rates:
+                    pairs_map = {}
+                    if "EUR" in rates and float(rates["EUR"]) > 0:
+                        pairs_map["EURUSD=X"] = 1.0 / float(rates["EUR"])
+                    if "GBP" in rates and float(rates["GBP"]) > 0:
+                        pairs_map["GBPUSD=X"] = 1.0 / float(rates["GBP"])
+                    if "JPY" in rates and float(rates["JPY"]) > 0:
+                        pairs_map["USDJPY=X"] = float(rates["JPY"])
+
+                    for pair, raw_p in pairs_map.items():
+                        is_jpy = "JPY" in pair
+                        if pair not in self.states:
+                            self.states[pair] = AssetState(pair, raw_p)
+                        state = self.states[pair]
+                        max_jump = 0.0018 if is_jpy else 0.0012
+                        p = raw_p
+                        if state.price > 0 and abs(p - state.price) / state.price > max_jump:
+                            step_dir = 1.0 if p > state.price else -1.0
+                            p = state.price + step_dir * (state.price * max_jump)
+                        state.anchor_price = p
+                        if abs(state.price - p) > (0.05 if is_jpy else 0.0003):
+                            state.price = p
+                        state.last_anchor_update = time.time()
+        except Exception as e:
+            logger.debug(f"Open.er-api fallback sync error: {e}")
+
     async def _sync_external_anchors(self):
-        """Background loop updating real quotes every 2.5 seconds."""
+        """Background loop updating real quotes every 2.5 seconds with open.er-api fallback."""
         async with httpx.AsyncClient() as client:
             while self.is_running:
                 try:
@@ -161,6 +203,12 @@ class LiveStreamer:
                         for fx_pair in ["EURUSD=X", "GBPUSD=X", "USDJPY=X"]
                     ]
                     await asyncio.gather(*fx_tasks, return_exceptions=True)
+
+                    # If any pair anchor hasn't updated in > 8s, query open.er-api.com
+                    now_ts = time.time()
+                    stale = any((now_ts - s.last_anchor_update) > 8.0 for s in self.states.values())
+                    if stale:
+                        await self._fetch_open_er_forex(client)
                 except Exception as e:
                     logger.debug(f"Anchor sync loop error: {e}")
 
@@ -203,6 +251,20 @@ class LiveStreamer:
             ticks_payload: Dict[str, Any] = {}
 
             for pair, state in self.states.items():
+                is_jpy = "JPY" in pair
+                # Micro-pip tick engine anchored tightly to real market quote (mean-reverting)
+                revert_drift = (state.anchor_price - state.price) * 0.25
+                if is_jpy:
+                    step = random.choice([-0.005, -0.002, -0.001, 0.001, 0.002, 0.005]) + revert_drift
+                    new_p = round(state.price + step, 3)
+                    if abs(new_p - state.anchor_price) <= 0.035:
+                        state.price = new_p
+                else:
+                    step = random.choice([-0.00003, -0.00001, -0.000005, 0.000005, 0.00001, 0.00003]) + revert_drift
+                    new_p = round(state.price + step, 5)
+                    if abs(new_p - state.anchor_price) <= 0.00015:
+                        state.price = new_p
+
                 self._update_candle_buckets(state, now_sec)
 
                 dec = 3 if "JPY" in pair else 5

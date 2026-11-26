@@ -181,9 +181,8 @@ export default function TradingChart({ pair, timeframe, onPriceUpdate }) {
     // Live candle countdown
     const secs = TF_SECONDS[curTf] || 60;
     const nowSec = Math.floor(Date.now() / 1000);
-    const bucketStart = nowSec - (nowSec % secs);
-    const remaining = secs - (nowSec - bucketStart);
-    setCountdown(remaining);
+    const rem = secs - (nowSec % secs);
+    setCountdown(rem === 0 ? secs : rem);
   }, [applyTick]);
 
   const { status: wsStatus } = useWebSocket(MARKET_WS_URL, {
@@ -191,36 +190,41 @@ export default function TradingChart({ pair, timeframe, onPriceUpdate }) {
     pingIntervalMs: 20000,
   });
 
-  // ─── Clock timer to update countdown every second ────────────────────────
+  // ─── Sub-second exact wall-clock UTC countdown timer (250ms tick) ───────────
+  const lastSecRef = useRef(null);
   useEffect(() => {
     const curTf = timeframe;
     const secs = TF_SECONDS[curTf] || 60;
     const tick = () => {
       const nowSec = Math.floor(Date.now() / 1000);
-      const bucketStart = nowSec - (nowSec % secs);
-      const rem = secs - (nowSec - bucketStart);
-      setCountdown(rem);
+      const rem = secs - (nowSec % secs);
+      const safeRem = rem === 0 ? secs : rem;
 
-      // Also refresh price line title with latest countdown
-      if (seriesRef.current && currentCandle && priceLineRef.current) {
-        try {
-          seriesRef.current.removePriceLine(priceLineRef.current);
-          const isCandleUp = currentCandle.close >= currentCandle.open;
-          priceLineRef.current = seriesRef.current.createPriceLine({
-            price: currentCandle.close,
-            color: isCandleUp ? '#10B981' : '#EF4444',
-            lineWidth: 1,
-            lineStyle: 2,
-            axisLabelVisible: true,
-            title: `⏱ ${fmtCountdown(rem)}`,
-          });
-        } catch {
-          // ignore
+      setCountdown(safeRem);
+
+      // Refresh price line title on second rollover
+      if (lastSecRef.current !== safeRem) {
+        lastSecRef.current = safeRem;
+        if (seriesRef.current && currentCandle && priceLineRef.current) {
+          try {
+            seriesRef.current.removePriceLine(priceLineRef.current);
+            const isCandleUp = currentCandle.close >= currentCandle.open;
+            priceLineRef.current = seriesRef.current.createPriceLine({
+              price: currentCandle.close,
+              color: isCandleUp ? '#10B981' : '#EF4444',
+              lineWidth: 1,
+              lineStyle: 2,
+              axisLabelVisible: true,
+              title: `⏱ ${fmtCountdown(safeRem)}`,
+            });
+          } catch {
+            // ignore
+          }
         }
       }
     };
     tick();
-    const id = setInterval(tick, 1000);
+    const id = setInterval(tick, 250);
     return () => clearInterval(id);
   }, [timeframe, currentCandle]);
 
